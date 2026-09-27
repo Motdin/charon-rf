@@ -33,7 +33,15 @@ function walk(dir, acc = []) {
 function run(title, cmd, args) {
   process.stdout.write(`\n── ${title} ──\n`);
   try {
-    execFileSync(cmd, args, { cwd: ROOT, stdio: 'inherit' });
+    execFileSync(cmd, args, {
+      cwd: ROOT,
+      stdio: 'inherit',
+      env: {
+        ...process.env,
+        // jangan pernah sentuh DB produksi saat QC
+        DB_PATH: process.env.DB_PATH && process.env.SM_USE_PROD_DB === '1' ? process.env.DB_PATH : join(ROOT, 'tmp', 'smoke.sqlite'),
+      },
+    });
     process.stdout.write(`✓ ${title}\n`);
     return true;
   } catch (err) {

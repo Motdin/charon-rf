@@ -1,3 +1,4 @@
+﻿import './_testdb.js';
 /**
  * Smoke: security (rug/honeypot) + smart-wallet enrichment.
  * Usage: node scripts/smoke-security.js
@@ -15,13 +16,13 @@ import { strategyById, updateStrategyConfig, setActiveStrategy } from '../src/db
 
 function assert(cond, msg) {
   if (!cond) throw new Error(`ASSERT FAIL: ${msg}`);
-  console.log(`  ✓ ${msg}`);
+  console.log(`  âœ“ ${msg}`);
 }
 
 initDb();
 clearSecurityCache();
 
-console.log('— saved wallets CRUD —');
+console.log('â€” saved wallets CRUD â€”');
 const before = listSavedWallets().length;
 addSavedWallet('whale1', '0x1111111111111111111111111111111111111111');
 addSavedWallet('whale2', '0x2222222222222222222222222222222222222222');
@@ -33,7 +34,7 @@ assert(listSavedWallets().find((w) => w.label === 'whale1') == null, 'wallet rem
 removeSavedWallet('0x2222222222222222222222222222222222222222');
 assert(listSavedWallets().find((w) => w.address.startsWith('0x2222')) == null, 'wallet removed by address');
 
-console.log('— evaluateSmartMoney filters —');
+console.log('â€” evaluateSmartMoney filters â€”');
 const report = {
   savedWalletExposure: { holderCount: 0 },
   snipers: { insiderCount: 5, sniperSharePercent: 40 },
@@ -53,7 +54,7 @@ const loose = evaluateSmartMoney(report, {
 });
 assert(loose.passed === true, 'loose strategy passes');
 
-console.log('— security scoring —');
+console.log('â€” security scoring â€”');
 // We can't hit live RPC reliably in smoke; test the local filter integration instead
 const baseMetrics = {
   marketCapUsd: 50000,

@@ -1,5 +1,6 @@
+﻿import './_testdb.js';
 /**
- * Runtime import test — catches missing exports / broken ESM graph
+ * Runtime import test â€” catches missing exports / broken ESM graph
  * that `node --check` cannot see. Run as part of QC.
  */
 const modules = [
@@ -52,7 +53,7 @@ const checks = [
   ['../src/execution/positions.js', ['monitorPositions', 'refreshPosition', 'startPositionMonitor']],
 ];
 
-console.log('\n── export spot-check ──');
+console.log('\nâ”€â”€ export spot-check â”€â”€');
 for (const [mod, names] of checks) {
   const ns = await import(mod);
   for (const n of names) {

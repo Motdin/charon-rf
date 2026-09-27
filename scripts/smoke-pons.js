@@ -1,8 +1,9 @@
+﻿import './_testdb.js';
 /**
  * Smoke: Pons launchpad signal mapping + ingest.
  * Usage: node scripts/smoke-pons.js
  *
- * Does not hit the network — exercises mapLaunch/ingest shape via a fake row.
+ * Does not hit the network â€” exercises mapLaunch/ingest shape via a fake row.
  */
 import { initDb } from '../src/db/connection.js';
 import { ponsLaunches, ponsGraduated, ponsLaunchFor, setPonsCandidateHandler } from '../src/signals/pons.js';
@@ -10,12 +11,12 @@ import { signalLabel } from '../src/pipeline/candidateBuilder.js';
 
 function assert(cond, msg) {
   if (!cond) throw new Error(`ASSERT FAIL: ${msg}`);
-  console.log(`  ✓ ${msg}`);
+  console.log(`  âœ“ ${msg}`);
 }
 
 initDb();
 
-console.log('— signal label includes launchpad —');
+console.log('â€” signal label includes launchpad â€”');
 const label = signalLabel({
   hasVolumeSpike: false,
   hasNewPool: true,
@@ -27,7 +28,7 @@ const label = signalLabel({
 assert(label.includes('pons'), `label has pons (${label})`);
 assert(label.includes('graduated'), `label has graduated (${label})`);
 
-console.log('— module exports —');
+console.log('â€” module exports â€”');
 assert(typeof setPonsCandidateHandler === 'function', 'setPonsCandidateHandler exported');
 assert(typeof ponsLaunchFor === 'function', 'ponsLaunchFor exported');
 assert(ponsLaunches instanceof Map, 'ponsLaunches is Map');

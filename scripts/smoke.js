@@ -1,5 +1,6 @@
+﻿import './_testdb.js';
 /**
- * Smoke test — runs the pipeline in dry-run without Telegram or live keys.
+ * Smoke test â€” runs the pipeline in dry-run without Telegram or live keys.
  * Usage: node scripts/smoke.js
  */
 import { initDb } from '../src/db/connection.js';
@@ -13,13 +14,13 @@ import { normalizeDecision } from '../src/pipeline/llm.js';
 
 function assert(cond, msg) {
   if (!cond) throw new Error(`ASSERT FAIL: ${msg}`);
-  console.log(`  ✓ ${msg}`);
+  console.log(`  âœ“ ${msg}`);
 }
 
-console.log('— init db —');
+console.log('â€” init db â€”');
 initDb();
 
-console.log('— strategies seeded —');
+console.log('â€” strategies seeded â€”');
 const sniper = activeStrategy();
 assert(sniper.id === 'sniper', `default strategy is sniper (${sniper.id})`);
 assert(sniper.min_source_count === 2, 'sniper requires 2 sources');
@@ -31,7 +32,7 @@ assert(degen.id === 'degen', 'degen activates');
 assert(degen.use_llm === false, 'degen is rule-based');
 setActiveStrategy('sniper');
 
-console.log('— filter: reject low mcap —');
+console.log('â€” filter: reject low mcap â€”');
 const bad = {
   token: { mint: '0x' + '11'.repeat(20), symbol: 'BAD', name: 'Bad' },
   metrics: {
@@ -49,7 +50,7 @@ const bad = {
 const badF = filterCandidate(bad);
 assert(badF.passed === false, `bad candidate rejected (${badF.failures.length} failures)`);
 
-console.log('— filter: accept strong overlap —');
+console.log('â€” filter: accept strong overlap â€”');
 const good = {
   token: { mint: '0x' + '22'.repeat(20), symbol: 'GOOD', name: 'Good' },
   metrics: {
@@ -74,12 +75,12 @@ const good = {
 const goodF = filterCandidate(good);
 assert(goodF.passed === true, `good candidate passed filters`);
 
-console.log('— rug score heuristic —');
+console.log('â€” rug score heuristic â€”');
 const rugLow = estimateRugScore({ liquidityUsd: 50000, holderCount: 300, top10Percent: 20, ageMs: 86400_000, volume24h: 30000 });
 const rugHigh = estimateRugScore({ liquidityUsd: 2000, holderCount: 5, top10Percent: 90, ageMs: 600_000, volume24h: 100000 });
 assert(rugLow < rugHigh, `rug score differentiates (${rugLow.toFixed(2)} < ${rugHigh.toFixed(2)})`);
 
-console.log('— dry-run position lifecycle —');
+console.log('â€” dry-run position lifecycle â€”');
 const beforeCount = openPositionCount();
 assert(canOpenMorePositions() || beforeCount < numSetting('max_open_positions', 3) || true, 'can evaluate open positions');
 const posId = createDryRunPosition(1, { ...good, token: { ...good.token, mint: '0x' + '22'.repeat(20) } }, {
@@ -89,14 +90,14 @@ const posId = createDryRunPosition(1, { ...good, token: { ...good.token, mint: '
   risks: [],
 }, 'smoke');
 assert(typeof posId === 'number' && posId > 0, `position created id=${posId}`);
-assert(openPositionCount() === beforeCount + 1, `open position count ${beforeCount} → ${openPositionCount()}`);
+assert(openPositionCount() === beforeCount + 1, `open position count ${beforeCount} â†’ ${openPositionCount()}`);
 const open = openPositions();
 const found = open.find((p) => p.id === posId);
 assert(found, 'openPositions returns the new position');
 assert(found.tp_percent === 50, 'TP copied from strategy (50%)');
 assert(found.sl_percent === -25, 'SL copied from strategy (-25%)');
 
-console.log('— candidate upsert + decision store —');
+console.log('â€” candidate upsert + decision store â€”');
 const cid = upsertCandidate({ ...good, filters: goodF }, 'smoke-key-1');
 assert(cid > 0, `candidate upserted id=${cid}`);
 const row = candidateById(cid);
@@ -113,11 +114,11 @@ const bid = storeBatchDecision(cid, [{ id: cid, candidate: good }], {
 });
 assert(bid > 0, `batch decision stored id=${bid}`);
 
-console.log('— LLM disabled fallback —');
+console.log('â€” LLM disabled fallback â€”');
 const batch = await decideCandidateBatch([{ id: cid, candidate: good, filters: goodF }], cid);
 assert(batch.verdict === 'WATCH', 'LLM disabled returns WATCH');
 
-console.log('— normalizeDecision clamps —');
+console.log('â€” normalizeDecision clamps â€”');
 const nd = normalizeDecision({ verdict: 'buy', confidence: 150, reason: 'x', risks: 'nope' });
 assert(nd.verdict === 'BUY', 'verdict uppercased');
 assert(nd.confidence === 100, 'confidence clamped to 100');
