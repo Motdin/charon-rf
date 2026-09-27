@@ -1,0 +1,41 @@
+# dependencies
+node_modules/
+
+# secrets & local config
+.env
+.env.*
+!.env.example
+
+# sqlite databases + WAL/SHM
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+charon-rh.sqlite
+charon-rh.sqlite-wal
+charon-rh.sqlite-shm
+
+# generated artifacts (pnl cards, temp)
+tmp/
+*.png
+!assets/**/*.png
+pnl_card*.png
+
+# logs
+*.log
+logs/
+npm-debug.log*
+yarn-error.log*
+pm2-logs/
+
+# os / editor
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# runtime
+coverage/
+.cache/

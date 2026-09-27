@@ -1,0 +1,21 @@
+{
+  "name": "charon-rh",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "description": "Charon-style trench agent for Robinhood Chain (EVM L2, chainId 4663) meme tokens",
+  "scripts": {
+    "start": "node index.js",
+    "check": "node --check index.js && node --check src/app.js && node --check src/config.js && node --check src/utils.js && node --check src/format.js && node --check src/liveExecutor.js && node --check src/db/connection.js && node --check src/db/settings.js && node --check src/db/candidates.js && node --check src/db/positions.js && node --check src/db/intents.js && node --check src/enrichment/index.js && node --check src/enrichment/gmgn.js && node --check src/enrichment/blockscout.js && node --check src/enrichment/security.js && node --check src/enrichment/wallets.js && node --check src/execution/router.js && node --check src/execution/positions.js && node --check src/execution/helpers.js && node --check src/pipeline/orchestrator.js && node --check src/pipeline/candidateBuilder.js && node --check src/pipeline/llm.js && node --check src/signals/dexscreener.js && node --check src/signals/uniswapEvents.js && node --check src/signals/priceMonitor.js && node --check src/telegram/send.js && node --check src/telegram/menu.js && node --check src/telegram/format.js",
+    "test": "node scripts/verify.js",
+    "build": "node scripts/verify.js",
+    "verify": "node scripts/verify.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.9",
+    "dotenv": "^16.4.7",
+    "node-telegram-bot-api": "^0.66.0",
+    "viem": "^2.21.0"
+  },
+  "allowScripts": {}
+}

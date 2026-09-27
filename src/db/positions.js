@@ -1,0 +1,155 @@
+import { db } from './connection.js';
+import { now, json, parseJson } from '../utils.js';
+import { numSetting, setting, strategyById, activeStrategy } from './settings.js';
+
+export function tradingMode() {
+  return setting('trading_mode', process.env.TRADING_MODE || 'dry_run');
+}
+
+export function openPositionCount() {
+  return db.prepare("SELECT COUNT(*) AS c FROM dry_run_positions WHERE status = 'open'").get().c;
+}
+
+export function canOpenMorePositions() {
+  const max = numSetting('max_open_positions', 3);
+  return openPositionCount() < max;
+}
+
+export function openPositions() {
+  return db
+    .prepare("SELECT * FROM dry_run_positions WHERE status = 'open' ORDER BY opened_at_ms DESC")
+    .all()
+    .map(rowToPosition);
+}
+
+export function positionById(id) {
+  const row = db.prepare('SELECT * FROM dry_run_positions WHERE id = ?').get(id);
+  return row ? rowToPosition(row) : null;
+}
+
+function rowToPosition(row) {
+  return {
+    ...row,
+    snapshot: parseJson(row.snapshot_json, {}),
+  };
+}
+
+function baseInsert({ candidateId, candidate, decision, mode, strategyId, sizeEth, entryPrice, entryMcap, tokenAmountEst, tokenAmountRaw, entrySignature }) {
+  const strat = strategyById(strategyId) || activeStrategy();
+  const result = db
+    .prepare(
+      `INSERT INTO dry_run_positions (
+        candidate_id, mint, symbol, status, opened_at_ms, size_eth, entry_price, entry_mcap,
+        token_amount_est, high_water_price, high_water_mcap, tp_percent, sl_percent,
+        trailing_enabled, trailing_percent, trailing_armed, partial_tp_done,
+        execution_mode, strategy_id, token_amount_raw, entry_signature, snapshot_json
+      ) VALUES (?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?)`
+    )
+    .run(
+      candidateId,
+      candidate.token.mint,
+      candidate.token.symbol || '',
+      now(),
+      sizeEth,
+      entryPrice,
+      entryMcap,
+      tokenAmountEst,
+      entryPrice,
+      entryMcap,
+      strat.tp_percent ?? 50,
+      strat.sl_percent ?? -25,
+      strat.trailing_enabled ? 1 : 0,
+      strat.trailing_percent ?? 20,
+      mode,
+      strategyId,
+      tokenAmountRaw ?? null,
+      entrySignature ?? null,
+      json({ candidate, decision })
+    );
+  return result.lastInsertRowid;
+}
+
+export function createDryRunPosition(candidateId, candidate, decision, source = 'dry_run') {
+  const strat = activeStrategy();
+  const sizeEth = strat.position_size_eth ?? numSetting('dry_run_buy_eth', 0.05);
+  const entryPrice = Number(candidate.metrics?.priceUsd) || 0;
+  const entryMcap = Number(candidate.metrics?.marketCapUsd) || 0;
+  const tokenAmountEst = entryPrice > 0 ? (sizeEth * 2500) / entryPrice : 0;
+  return baseInsert({
+    candidateId,
+    candidate,
+    decision,
+    mode: 'dry_run',
+    strategyId: strat.id,
+    sizeEth,
+    entryPrice,
+    entryMcap,
+    tokenAmountEst,
+    tokenAmountRaw: String(Math.floor(tokenAmountEst * 1e18)),
+  });
+}
+
+export function createLivePosition(candidateId, candidate, decision, swap, source = 'live') {
+  const strat = activeStrategy();
+  const sizeEth = swap.sizeEth ?? strat.position_size_eth ?? 0.05;
+  const entryPrice = Number(candidate.metrics?.priceUsd) || 0;
+  const entryMcap = Number(candidate.metrics?.marketCapUsd) || 0;
+  const tokenAmountEst = swap.outputAmount ? Number(swap.outputAmount) / 1e18 : entryPrice > 0 ? (sizeEth * 2500) / entryPrice : 0;
+  return baseInsert({
+    candidateId,
+    candidate,
+    decision,
+    mode: 'live',
+    strategyId: strat.id,
+    sizeEth,
+    entryPrice,
+    entryMcap,
+    tokenAmountEst,
+    tokenAmountRaw: String(swap.outputAmount || Math.floor(tokenAmountEst * 1e18)),
+    entrySignature: swap.signature,
+  });
+}
+
+export function recordTrade({ positionId, mint, side, price, mcap, sizeEth, tokenAmountEst, reason, payload }) {
+  db.prepare(
+    `INSERT INTO dry_run_trades (position_id, mint, side, at_ms, price, mcap, size_eth, token_amount_est, reason, payload_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(positionId, mint, side, now(), price, mcap, sizeEth, tokenAmountEst, reason, json(payload));
+}
+
+export function closePosition({ id, exitPrice, exitMcap, exitReason, pnlPercent, pnlEth, exitSignature }) {
+  db.prepare(
+    `UPDATE dry_run_positions
+     SET status = 'closed', closed_at_ms = ?, exit_price = ?, exit_mcap = ?, exit_reason = ?,
+         pnl_percent = ?, pnl_eth = ?, exit_signature = ?
+     WHERE id = ?`
+  ).run(now(), exitPrice, exitMcap, exitReason, pnlPercent, pnlEth, exitSignature ?? null, id);
+}
+
+export function updateHighWater({ id, highWaterPrice, highWaterMcap, trailingArmed }) {
+  db.prepare('UPDATE dry_run_positions SET high_water_price = ?, high_water_mcap = ?, trailing_armed = ? WHERE id = ?').run(
+    highWaterPrice,
+    highWaterMcap,
+    trailingArmed ? 1 : 0,
+    id
+  );
+}
+
+export function markPartialTpDone(id) {
+  db.prepare('UPDATE dry_run_positions SET partial_tp_done = 1 WHERE id = ?').run(id);
+}
+
+export function updateTokenAmount(id, amountRaw) {
+  db.prepare('UPDATE dry_run_positions SET token_amount_raw = ? WHERE id = ?').run(String(amountRaw), id);
+}
+
+export function closedPositions(limit = 50) {
+  return db
+    .prepare("SELECT * FROM dry_run_positions WHERE status = 'closed' ORDER BY closed_at_ms DESC LIMIT ?")
+    .all(limit)
+    .map(rowToPosition);
+}
+
+export function allPositions(limit = 100) {
+  return db.prepare('SELECT * FROM dry_run_positions ORDER BY opened_at_ms DESC LIMIT ?').all(limit).map(rowToPosition);
+}
