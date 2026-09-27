@@ -16,6 +16,25 @@ export function canOpenMorePositions() {
   return openPositionCount() < max;
 }
 
+/**
+ * Apakah sudah ada posisi TERBUKA untuk mint ini?
+ * Mencegah buy ganda token yang sama (trailing/TP belum jalan).
+ */
+export function hasOpenPositionForMint(mint) {
+  if (!mint) return false;
+  const row = db
+    .prepare("SELECT id FROM dry_run_positions WHERE status = 'open' AND lower(mint) = lower(?) LIMIT 1")
+    .get(String(mint));
+  return Boolean(row);
+}
+
+export function openPositionIdForMint(mint) {
+  const row = db
+    .prepare("SELECT id FROM dry_run_positions WHERE status = 'open' AND lower(mint) = lower(?) LIMIT 1")
+    .get(String(mint));
+  return row?.id ?? null;
+}
+
 export function openPositions() {
   return db
     .prepare("SELECT * FROM dry_run_positions WHERE status = 'open' ORDER BY opened_at_ms DESC")
