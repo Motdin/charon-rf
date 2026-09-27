@@ -33,20 +33,37 @@ export async function refreshPosition(position, { autoExit = true } = {}) {
   const price = firstPositiveNumber(toNumber(dex?.priceUsd), position.high_water_price, position.entry_price);
   const mcap = firstPositiveNumber(toNumber(dex?.market_cap), position.high_water_mcap, position.entry_mcap);
 
-  if (!Number.isFinite(Number(mcap)) || !Number.isFinite(Number(position.entry_mcap)) || Number(position.entry_mcap) <= 0) {
+  // PnL berdasarkan HARGA USD (bukan market cap / volume)
+  const entryPrice = Number(position.entry_price);
+  const entryMcap = Number(position.entry_mcap);
+
+  if ((!Number.isFinite(entryPrice) || entryPrice <= 0) && (!Number.isFinite(entryMcap) || entryMcap <= 0)) {
     return null;
   }
 
-  const highWaterMcap = Math.max(Number(position.high_water_mcap || 0), Number(mcap));
   const highWaterPrice = Math.max(Number(position.high_water_price || 0), Number(price || 0));
+  const highWaterMcap = Math.max(Number(position.high_water_mcap || 0), Number(mcap || 0));
 
-  let pnlPercent = (Number(mcap) / Number(position.entry_mcap) - 1) * 100;
-  let pnlEth = Number(position.size_eth) * pnlPercent / 100;
+  // Prioritas: rasio harga USD → fallback rasio mcap
+  let pnlPercent;
+  if (entryPrice > 0 && price > 0) {
+    pnlPercent = (price / entryPrice - 1) * 100;
+  } else {
+    pnlPercent = (Number(mcap) / entryMcap - 1) * 100;
+  }
+  let pnlEth = (Number(position.size_eth) * pnlPercent) / 100;
 
   const tpHit = pnlPercent >= Number(position.tp_percent);
   const slHit = pnlPercent <= Number(position.sl_percent);
   const trailingArmed = position.trailing_armed || (position.trailing_enabled && tpHit);
-  const trailDrop = highWaterMcap > 0 ? (Number(mcap) / highWaterMcap - 1) * 100 : 0;
+
+  // Trailing: jarak turun dari high-water HARGA (bukan mcap)
+  const trailDrop =
+    highWaterPrice > 0 && price > 0
+      ? (price / highWaterPrice - 1) * 100
+      : highWaterMcap > 0
+        ? (Number(mcap) / highWaterMcap - 1) * 100
+        : 0;
   const trailingHit =
     trailingArmed && position.trailing_enabled && trailDrop <= -Math.abs(Number(position.trailing_percent));
 
