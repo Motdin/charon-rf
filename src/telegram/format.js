@@ -25,8 +25,14 @@ export function candidateSummary(candidate, decision) {
 
 export function positionSummary(position) {
   const pnl = Number(position.pnl_percent ?? position.pnlPercent ?? 0);
+  // Ticker bisa sama antar token — selalu tampilkan CA (dipendekkan)
+  const ca = position.mint ? `${String(position.mint).slice(0, 6)}…${String(position.mint).slice(-4)}` : '?';
+  const head = position.symbol
+    ? `<b>${escapeHtml(position.symbol)}</b> <code>${escapeHtml(ca)}</code>`
+    : `<code>${escapeHtml(position.mint || '?')}</code>`;
   return [
-    `<b>${escapeHtml(position.symbol || short(position.mint, 8))}</b> #${position.id}`,
+    `${head} #${position.id}`,
+    `CA: <code>${escapeHtml(position.mint || '')}</code>`,
     `Status: ${position.status} · Mode: ${position.execution_mode}`,
     `Entry: ${fmtUsd(position.entry_mcap)} mcap · Size: ${fmtEth(position.size_eth)}`,
     `PnL: ${fmtPct(pnl)}`,
