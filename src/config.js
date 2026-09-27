@@ -39,7 +39,7 @@ export const ENABLE_LLM = process.env.ENABLE_LLM !== 'false';
 export const DEXSCREENER_ENABLED = process.env.DEXSCREENER_ENABLED !== 'false';
 export const DEXSCREENER_POLL_MS = Number(process.env.DEXSCREENER_POLL_MS || 30_000);
 export const ONCHAIN_EVENTS_ENABLED = process.env.ONCHAIN_EVENTS_ENABLED !== 'false';
-export const ONCHAIN_POLL_MS = Number(process.env.ONCHAIN_POLL_MS || 15_000);
+export const ONCHAIN_POLL_MS = Number(process.env.ONCHAIN_POLL_MS || 30_000);
 export const POSITION_CHECK_MS = Number(process.env.POSITION_CHECK_MS || 10_000);
 export const SIGNAL_MIN_SOURCE_COUNT = Number(process.env.MIN_SOURCE_COUNT || 2);
 
