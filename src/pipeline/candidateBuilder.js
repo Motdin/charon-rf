@@ -65,13 +65,18 @@ export function filterCandidate(candidate) {
   }
 
   // Volume
-  if (strat.min_volume_h24_usd > 0 && vol24 < strat.min_volume_h24_usd) {
-    failures.push(`volume24h: ${vol24} < ${strat.min_volume_h24_usd}`);
-  }
-
-  // Transactions
-  if (strat.min_txns_h24 > 0 && txns < strat.min_txns_h24) {
-    failures.push(`txns24h: ${txns} < ${strat.min_txns_h24}`);
+  // Volume / txn — skip jika token terlalu muda (launchpad baru, belum ada data aggregator)
+  const isFresh = ageMs != null && ageMs < 30 * 60_000;
+  if (!isFresh) {
+    if (strat.min_volume_h24_usd > 0 && vol24 < strat.min_volume_h24_usd) {
+      failures.push(`volume24h: ${vol24} < ${strat.min_volume_h24_usd}`);
+    }
+    if (strat.min_txns_h24 > 0 && txns < strat.min_txns_h24) {
+      failures.push(`txns24h: ${txns} < ${strat.min_txns_h24}`);
+    }
+    if (strat.trending_min_volume_usd > 0 && vol24 < strat.trending_min_volume_usd) {
+      failures.push(`trending volume: ${vol24} < ${strat.trending_min_volume_usd}`);
+    }
   }
 
   // Holders
@@ -90,11 +95,6 @@ export function filterCandidate(candidate) {
     if (dist != null && dist > strat.max_ath_distance_pct) {
       failures.push(`dip distance: ${dist.toFixed(0)}% not deep enough (need ≤ ${strat.max_ath_distance_pct}%)`);
     }
-  }
-
-  // Trending volume floor
-  if (strat.trending_min_volume_usd > 0 && vol24 < strat.trending_min_volume_usd) {
-    failures.push(`trending volume: ${vol24} < ${strat.trending_min_volume_usd}`);
   }
 
   // Rug score
