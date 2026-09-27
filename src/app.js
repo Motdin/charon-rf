@@ -5,6 +5,7 @@ import { activeStrategy, numSetting } from './db/settings.js';
 import { startDexScreenerPolling, setCandidateHandler } from './signals/dexscreener.js';
 import { startOnchainPolling, setOnchainCandidateHandler } from './signals/uniswapEvents.js';
 import { startPriceMonitor, setPriceAlertHandler } from './signals/priceMonitor.js';
+import { startPonsPolling, setPonsCandidateHandler } from './signals/pons.js';
 import { processCandidateFromSignals } from './pipeline/orchestrator.js';
 import { startPositionMonitor } from './execution/positions.js';
 import { startTelegramBot } from './telegram/send.js';
@@ -46,11 +47,13 @@ export async function startCharon() {
   setCandidateHandler(processCandidateFromSignals);
   setOnchainCandidateHandler(processCandidateFromSignals);
   setPriceAlertHandler(processCandidateFromSignals);
+  setPonsCandidateHandler(processCandidateFromSignals);
 
   // Start collectors + monitors
   startDexScreenerPolling();
   startOnchainPolling();
   startPriceMonitor(20_000);
+  startPonsPolling();
   startPositionMonitor(numSetting('position_check_ms', 10_000));
 
   // Telegram control plane

@@ -45,6 +45,13 @@ export const SIGNAL_MIN_SOURCE_COUNT = Number(process.env.MIN_SOURCE_COUNT || 2)
 
 export const BLOCKSCOUT_API = process.env.BLOCKSCOUT_API || 'https://robinhoodchain.blockscout.com/api';
 
+// Pons launchpad — Robinhood Chain launch feed (public, no key)
+// https://docs.ponsfamily.com/llms.txt
+export const PONS_ENABLED = process.env.PONS_ENABLED !== 'false';
+export const PONS_POLL_MS = Number(process.env.PONS_POLL_MS || 30_000);
+export const PONS_API_BASE = process.env.PONS_API_BASE || 'https://www.ponsfamily.com/api';
+export const PONS_LOOKBACK_MS = Number(process.env.PONS_LOOKBACK_MS || 30 * 60_000);
+
 // GMGN OpenAPI — optional primary enrichment (free tier: 5 weight/window).
 // When unavailable the pipeline falls back to DexScreener + Blockscout.
 export const GMGN_ENABLED = process.env.GMGN_ENABLED === 'true';
