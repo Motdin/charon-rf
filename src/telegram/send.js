@@ -150,9 +150,38 @@ const execFileAsync = promisify(execFile);
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = join(__dirname, '..', '..');
 
-function resolvePython() {
-  // VPS (Debian/Ubuntu) biasanya `python3`; Windows dev `python`
-  return process.env.PYTHON || process.env.MIMO_PYTHON || 'python3';
+function resolvePythonCandidates() {
+  const list = [];
+  if (process.env.PYTHON) list.push(process.env.PYTHON);
+  if (process.env.MIMO_PYTHON) list.push(process.env.MIMO_PYTHON);
+  list.push('python3', '/usr/bin/python3', '/usr/local/bin/python3', 'python');
+  return [...new Set(list)];
+}
+
+/**
+ * Cari python yang benar-benar bisa import PIL.
+ * Return { cmd, version } atau { error, kind: 'NO_PYTHON' | 'NO_PIL' | 'OTHER' }
+ */
+async function probePython() {
+  const tried = [];
+  for (const cmd of resolvePythonCandidates()) {
+    try {
+      const { stdout } = await execFileAsync(cmd, ['-c', 'import PIL; print(PIL.__version__)'], {
+        timeout: 10_000,
+        maxBuffer: 64 * 1024,
+      });
+      return { cmd, version: stdout.trim() };
+    } catch (err) {
+      const msg = String(err.message || err);
+      tried.push(`${cmd}: ${msg.split('\n')[0].slice(0, 80)}`);
+      if (/ENOENT|not recognized|command not found/i.test(msg)) continue;
+      // Python ada tapi PIL tidak — stop, ini masalahnya
+      if (/No module named/i.test(msg) && /PIL|Pillow/i.test(msg)) {
+        return { error: msg, kind: 'NO_PIL', cmd, tried };
+      }
+    }
+  }
+  return { error: tried.join(' | '), kind: 'NO_PYTHON', tried };
 }
 
 function parseDateArg(args) {
@@ -218,16 +247,17 @@ export function buildTextPnlCard(dateStr) {
 /**
  * PNG PnL card via scripts/render_pnl_card.py (needs Python + Pillow).
  */
-async function generatePnlCardPng({ date }) {
+async function generatePnlCardPng({ date, pyCmd }) {
   const dbPath = join(PROJECT_ROOT, process.env.DB_PATH || './charon-rh.sqlite');
   const outDir = join(PROJECT_ROOT, 'tmp');
   if (!existsSync(outDir)) mkdirSync(outDir, { recursive: true });
   const outPath = join(outDir, `pnl_card_${date}.png`);
   const script = join(PROJECT_ROOT, 'scripts', 'render_pnl_card.py');
 
-  const { stdout } = await execFileAsync(resolvePython(), [script, '--db', dbPath, '--date', date, '--out', outPath], {
+  const { stdout } = await execFileAsync(pyCmd, [script, '--db', dbPath, '--date', date, '--out', outPath], {
     cwd: PROJECT_ROOT,
     maxBuffer: 4 * 1024 * 1024,
+    timeout: 30_000,
   });
 
   const lines = stdout.trim().split('\n');
@@ -256,10 +286,52 @@ async function handlePnlCard(chatId, args, bot) {
   }
 
   // PNG card — butuh Python + Pillow
+  const probe = await probePython();
+  if (probe.kind === 'NO_PYTHON') {
+    await bot.sendMessage(
+      chatId,
+      [
+        '⚠️ <b>Binary python3 tidak ditemukan</b> oleh process bot.',
+        '',
+        'Di VPS jalankan:',
+        '<code>which python3</code>',
+        '<code>python3 --version</code>',
+        '<code>apt install -y python3</code>',
+        '',
+        'Jika python3 ada tapi PM2 tidak melihatnya, set path eksplisit di .env:',
+        '<code>PYTHON=/usr/bin/python3</code>',
+        '<code>pm2 restart charon-rh --update-env</code>',
+        '',
+        `<pre>${escapeHtml(text)}</pre>`,
+      ].join('\n'),
+      { parse_mode: 'HTML' }
+    );
+    return;
+  }
+  if (probe.kind === 'NO_PIL') {
+    await bot.sendMessage(
+      chatId,
+      [
+        `⚠️ <b>Python ada (${escapeHtml(probe.cmd)}) tapi Pillow tidak terimport.</b>`,
+        '',
+        'Install Pillow:',
+        '<code>apt install -y python3-pil</code>',
+        '<code>python3 -c "from PIL import Image; print(1)"</code>',
+        '<code>pm2 restart charon-rh</code>',
+        '',
+        `Detail: <code>${escapeHtml(String(probe.error).slice(0, 180))}</code>`,
+        '',
+        `<pre>${escapeHtml(text)}</pre>`,
+      ].join('\n'),
+      { parse_mode: 'HTML' }
+    );
+    return;
+  }
+
   try {
-    const result = await generatePnlCardPng({ date });
+    const result = await generatePnlCardPng({ date, pyCmd: probe.cmd });
     if (!result.outPath || !existsSync(result.outPath)) {
-      throw new Error('PNG tidak terbentuk');
+      throw new Error('PNG tidak terbentuk di ' + result.outPath);
     }
     await bot.sendPhoto(chatId, result.outPath, {
       caption: `📊 <b>Daily PnL card</b> — ${escapeHtml(date)}\n\n<pre>${escapeHtml(text)}</pre>\n\nSiap diunggah ke X.`,
@@ -272,30 +344,13 @@ async function handlePnlCard(chatId, args, bot) {
     }
   } catch (err) {
     const msg = String(err.message || err);
-    // Hanya anggap "python hilang" jika benar-benar binary tidak ditemukan.
-    // JANGAN match substring "python" — err.message selalu memuat nama command.
-    const noPython =
-      /ENOENT/i.test(msg) ||
-      /command not found/i.test(msg) ||
-      /not recognized as an internal or external/i.test(msg) ||
-      /No module named/i.test(msg);
-
-    const realError = msg.replace(/^Command failed:.*?python3?\s+/i, '').split('\n').slice(0, 4).join(' · ');
-
+    const realError = msg.replace(/^Command failed:.*?\n?/i, '').split('\n').slice(0, 5).join(' · ');
     await bot.sendMessage(
       chatId,
       [
-        noPython
-          ? '⚠️ <b>Python tidak ditemukan</b> — PNG card butuh python3 + Pillow.'
-          : `⚠️ <b>Render PNG gagal</b>: <code>${escapeHtml(realError.slice(0, 200))}</code>`,
+        `⚠️ <b>Render PNG gagal</b> (python=${escapeHtml(probe.cmd)} Pillow ${escapeHtml(probe.version || '?')})`,
         '',
-        noPython ? 'Install:' : 'Cek dependency:',
-        '<code>apt install -y python3 python3-pil</code>',
-        '<code>python3 -c "from PIL import Image; print(1)"</code>',
-        '<code>pm2 restart charon-rh</code>',
-        '',
-        '<b>Text card (tanpa Python) tetap jalan:</b>',
-        '<code>/pnlcard text</code>',
+        `<code>${escapeHtml(realError.slice(0, 300))}</code>`,
         '',
         `<pre>${escapeHtml(text)}</pre>`,
       ].join('\n'),
@@ -517,6 +572,33 @@ export function startTelegramBot() {
             } catch (err) {
               await sendTelegram(`❌ ${escapeHtml(err.message)}`, { parse_mode: 'HTML' });
             }
+            break;
+          }
+
+          case '/failures': {
+            // Kandidat terbaru yang ditolak filter — untuk debug strategi
+            const rows = db
+              .prepare(
+                `SELECT id, mint, status, created_at_ms, filter_result_json, candidate_json
+                 FROM candidates
+                 WHERE json_extract(filter_result_json, '$.passed') = 0
+                 ORDER BY created_at_ms DESC LIMIT 8`
+              )
+              .all();
+            if (!rows.length) {
+              await sendTelegram('Belum ada kandidat yang ditolak filter.');
+              break;
+            }
+            const lines = rows.map((r) => {
+              const f = JSON.parse(r.filter_result_json || '{}');
+              const c = JSON.parse(r.candidate_json || '{}');
+              const sym = c.token?.symbol || r.mint.slice(0, 10);
+              const age = Math.round((Date.now() - r.created_at_ms) / 60000);
+              return `• <b>${escapeHtml(sym)}</b> (${age}m lalu)\n  ${escapeHtml((f.failures || []).slice(0, 3).join('; ') || '—')}`;
+            });
+            await sendTelegram(
+              [`<b>Kandidat ditolak filter</b> (8 terbaru)`, '', ...lines, '', 'Longgarkan via /stratset atau ganti /strategy'].join('\n')
+            );
             break;
           }
 
