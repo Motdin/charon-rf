@@ -25,18 +25,26 @@ export function candidateSummary(candidate, decision) {
 
 export function positionSummary(position) {
   const pnl = Number(position.pnl_percent ?? position.pnlPercent ?? 0);
-  // Ticker bisa sama antar token — selalu tampilkan CA (dipendekkan)
   const ca = position.mint ? `${String(position.mint).slice(0, 6)}…${String(position.mint).slice(-4)}` : '?';
   const head = position.symbol
     ? `<b>${escapeHtml(position.symbol)}</b> <code>${escapeHtml(ca)}</code>`
     : `<code>${escapeHtml(position.mint || '?')}</code>`;
+
+  const fmtUsdPrice = (v) => {
+    const n = Number(v);
+    if (!Number.isFinite(n) || n <= 0) return '—';
+    if (n >= 1) return `$${n.toFixed(4)}`;
+    return `$${n.toPrecision(4)}`;
+  };
+
   return [
     `${head} #${position.id}`,
     `CA: <code>${escapeHtml(position.mint || '')}</code>`,
     `Status: ${position.status} · Mode: ${position.execution_mode}`,
-    `Entry: ${fmtUsd(position.entry_mcap)} mcap · Size: ${fmtEth(position.size_eth)}`,
+    `Entry: ${fmtUsdPrice(position.entry_price)} · Size: ${fmtEth(position.size_eth)}`,
+    position.exit_price ? `Exit: ${fmtUsdPrice(position.exit_price)}` : '',
     `PnL: ${fmtPct(pnl)}`,
-    position.exit_reason ? `Exit: ${position.exit_reason}` : '',
+    position.exit_reason ? `Exit reason: ${position.exit_reason}` : '',
     position.pnl_eth != null ? `PnL ETH: ${fmtEth(position.pnl_eth)}` : '',
   ]
     .filter(Boolean)
