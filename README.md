@@ -94,18 +94,27 @@ SLIPPAGE_BPS=300
 /stratset <id> <key> <value>
                    hot-edit any strategy parameter (no restart)
                    e.g. /stratset sniper tp_percent 75
-/positions         open + closed
+/positions         open + closed (entry/exit USD price + CA)
 /pnl               win rate + net ETH
 /pnlcard [YYYY-MM-DD]
                    daily PnL card PNG (1200×675) ready for X / Twitter
 /pnlcard text [YYYY-MM-DD]
                    copy-paste text card for X
+/failures          last 8 rejected candidates + why
 /filters           active thresholds
+/learn [1h|24h|7d] LLM analyze closed trades → store lessons
+/lessons           list active lessons
+/lessondel <id>    delete a lesson
+/wallets           list tracked smart wallets
+/walletadd <label> <0x…>
+/walletremove <label>
+/security <0x mint>  rug/honeypot check
 /intents           pending confirm trades
 /confirm <id>      approve live buy
 /reject  <id>      reject
 /mode dry_run|confirm|live
 /enable on|off     toggle auto-buy
+/cancel            abort pending interactive edit
 ```
 
 ### `/menu → Strategy` (Charon parity)
@@ -422,6 +431,45 @@ GMGN_REQUEST_DELAY_MS=2500    # 1 req / 5s max (official rule)
 
 Check current budget from Telegram `/status` or logs at boot.
 
+## Learning loop (LLM)
+
+Charon-RH can learn from its own closed trades and feed lessons back into
+future buy decisions.
+
+```mermaid
+flowchart LR
+    A[Closed trades] --> B["/learn 24h"]
+    B --> C[LLM extracts lessons]
+    C --> D[learning_lessons table]
+    D --> E[injected into next LLM prompt]
+    E --> F[better BUY / WATCH / PASS]
+    F --> A
+```
+
+| Command | What it does |
+|---|---|
+| `/learn 24h` | Analyze last 24h closed trades with LLM → store 1–5 lessons |
+| `/learn 1h` / `6h` / `7d` | Other windows |
+| `/lessons` | Show active lessons with evidence |
+| `/lessondel <id>` | Remove a lesson |
+
+Example lesson:
+
+```
+🔴 SL exits hit avg -28% vs target -15% — widen SL or check price source
+   [5/8 SL, avg loss -28%]
+```
+
+- **LLM** (OpenAI-compatible: `LLM_BASE_URL` / `LLM_MODEL`) returns strict JSON
+  `{lessons:[{lesson, evidence, severity}]}`
+- **Fallback** if LLM is off or fails: rule-based lessons from stats
+  (win rate, SL ratio, avg loss, net PnL)
+- Stored lessons are injected as `recent_lessons` on every LLM batch decision
+  (`src/pipeline/llm.js` → `activeLessonsForPrompt`)
+- Table: `learning_lessons` in SQLite
+
+Typical cadence: run `/learn 24h` once a day after a dry-run session.
+
 ## Overlap signals (the Charon idea)
 
 A candidate is stronger when **multiple sources agree**:
@@ -450,12 +498,23 @@ Factory (v2): `0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e`
 ## Risk controls
 
 - Fixed position size per strategy (`position_size_eth`)
-- `max_open_positions` cap
+- `max_open_positions` cap (per strategy: degen=5, others=3)
+- **1 open position per token** — no duplicate buys while holding
 - Fresh filter re-check before every execution (anti-stale)
 - ETH reserve floor (`LIVE_MIN_ETH_RESERVE`)
 - TP / SL / trailing TP / optional partial TP / max hold
+- **PnL from USD price** (`price / entry_price`), not market cap
+- Trailing tracks **price high-water**, not mcap
+- SL is a *trigger threshold* (polled every `POSITION_CHECK_MS`) — not a
+  guaranteed fill; violent memecoin dumps can exit worse than the SL target
 - Rug score (liquidity, holder concentration, age, volume/liq ratio)
+- Security gate: honeypot / mint / owner / proxy (`require_security_pass`)
 - Default mode is `dry_run` — no wallet needed
+
+### Debug: `/failures`
+
+Shows the last 8 rejected candidates and the exact filter reasons — use this
+to tune `/stratset` instead of guessing.
 
 ## Storage
 
@@ -475,7 +534,8 @@ charon-rh/
     signals/       dexscreener, uniswapEvents, priceMonitor, pons
     enrichment/    gmgn, blockscout, security, wallets, aggregate
     pipeline/      candidateBuilder, llm, orchestrator
-    execution/     router (buy/sell), positions (TP/SL)
+    learning/      lessons.js — LLM trade review → /learn
+    execution/     router (buy/sell), positions (TP/SL, price-based PnL)
     telegram/      bot + menu + format
     liveExecutor.js  viem + Uniswap V3 SwapRouter02
   scripts/         smoke suites, verify, render_pnl_card.py
