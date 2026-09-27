@@ -37,6 +37,9 @@ let candidateHandler = null;
 const seenOnchain = new Map();
 let lastBlock = null;
 let consecutiveErrors = 0;
+// Backoff saat RPC rate-limit (429 / Too Many Requests)
+let backoffUntil = 0;
+const MAX_BLOCK_RANGE = 50n; // jangan scan terlalu lebar — free RPC sensitif
 
 export function setOnchainCandidateHandler(fn) {
   candidateHandler = fn;
@@ -51,29 +54,42 @@ function recordSwap(mint, volumeEthAbs) {
   });
 }
 
+function isRateLimited(err) {
+  const msg = String(err?.message || err?.shortMessage || err?.details || '');
+  return /429|Too Many Requests|rate.?limit|exceeded|timeout|Request failed/i.test(msg);
+}
+
+function noteRateLimit(err, tag = 'logs') {
+  consecutiveErrors++;
+  const backoffMs = Math.min(120_000, 5_000 * 2 ** Math.min(consecutiveErrors, 5));
+  backoffUntil = now() + backoffMs;
+  console.log(`[chain] ${tag}: ${isRateLimited(err) ? 'RATE LIMITED' : 'error'} — backoff ${Math.round(backoffMs / 1000)}s`);
+}
+
 async function processNewBlocks() {
+  if (now() < backoffUntil) return;
+
   const latest = await client.getBlockNumber();
   if (lastBlock == null) {
-    lastBlock = latest - 50n; // start slightly behind
+    // mulai sedikit di belakang tipis, jangan langsung scan 50 block
+    lastBlock = latest > 20n ? latest - 20n : latest;
     return;
   }
   if (latest <= lastBlock) return;
 
-  // Cap the range to avoid huge scans
   const fromBlock = lastBlock + 1n;
-  const toBlock = latest > fromBlock + 200n ? fromBlock + 200n : latest;
+  const toBlock = latest > fromBlock + MAX_BLOCK_RANGE ? fromBlock + MAX_BLOCK_RANGE : latest;
   lastBlock = toBlock;
 
-  // Scan Uniswap V3 Swap events
+  // Scan Uniswap V3 Swap events (dengan batas kecil)
   try {
     const logs = await client.getLogs({
       event: SWAP_V3,
       fromBlock,
       toBlock,
     });
-    for (const log of logs.slice(0, 200)) {
-      // We don't have token address in Swap; track by pool (log.address)
-      // Enrichment resolves pool -> tokens later. For overlap we count pool activity.
+    consecutiveErrors = 0;
+    for (const log of logs.slice(0, 80)) {
       const pool = normalizeAddress(log.address);
       recordSwap(pool, 0);
       if (log.args && onchainSwaps.get(pool)?.count === 3) {
@@ -85,13 +101,17 @@ async function processNewBlocks() {
       }
     }
   } catch (err) {
-    // some RPC endpoints limit getLogs; ignore and continue
-    if (consecutiveErrors < 3) console.log(`[chain] swap logs: ${err.message}`);
+    if (isRateLimited(err)) noteRateLimit(err, 'swap');
+    else if (consecutiveErrors < 3) console.log(`[chain] swap logs: ${err.message}`);
   }
 
-  // Scan for PairCreated-like factory events when factory address is set
+  // PoolCreated — hanya jika factory diset, dan skip saat sedang backoff
   try {
-    if (UNISWAP_V3_FACTORY && UNISWAP_V3_FACTORY !== '0x0000000000000000000000000000000000000000') {
+    if (
+      UNISWAP_V3_FACTORY &&
+      UNISWAP_V3_FACTORY !== '0x0000000000000000000000000000000000000000' &&
+      now() >= backoffUntil
+    ) {
       const created = await client.getLogs({
         address: UNISWAP_V3_FACTORY,
         event: parseAbiItem(
@@ -100,11 +120,11 @@ async function processNewBlocks() {
         fromBlock,
         toBlock,
       });
+      consecutiveErrors = 0;
       for (const log of created) {
         const token0 = normalizeAddress(log.args?.token0);
         const token1 = normalizeAddress(log.args?.token1);
         const pool = normalizeAddress(log.args?.pool);
-        // Prefer the non-WETH token as the meme candidate
         const mint = token0 && !token0.includes('0bbd7308') ? token0 : token1;
         if (!mint) continue;
         const key = `pool:${pool}`;
@@ -122,9 +142,8 @@ async function processNewBlocks() {
         });
         storeSignalEvent(mint, 'new_pool', 'uniswap_v3_factory', log.args);
 
-        // Trigger overlap with DexScreener if we already know the token
         const existing = trending.get(mint);
-        const sourceCount = (existing ? 1 : 0) + 1; // onchain + optional dexscreener
+        const sourceCount = (existing ? 1 : 0) + 1;
         if (candidateHandler) {
           await candidateHandler({
             mint,
@@ -145,9 +164,8 @@ async function processNewBlocks() {
       }
     }
   } catch (err) {
-    consecutiveErrors++;
-    if (consecutiveErrors < 5) console.log(`[chain] poolCreated: ${err.message}`);
-    if (consecutiveErrors > 10) consecutiveErrors = 0;
+    if (isRateLimited(err)) noteRateLimit(err, 'poolCreated');
+    else if (consecutiveErrors < 5) console.log(`[chain] poolCreated: ${err.message}`);
   }
 
   // Emit overlap candidates when on-chain swap activity coincides with DexScreener volume
@@ -193,12 +211,13 @@ export function startOnchainPolling() {
   const loop = async () => {
     try {
       await pollOnchainOnce();
-      consecutiveErrors = 0;
     } catch (err) {
-      consecutiveErrors++;
-      console.log(`[chain] poll failed: ${err.message}`);
+      if (isRateLimited(err)) noteRateLimit(err, 'poll');
+      else console.log(`[chain] poll failed: ${err.message}`);
     }
-    setTimeout(loop, ONCHAIN_POLL_MS);
+    // perpanjang interval saat sedang backoff
+    const wait = now() < backoffUntil ? Math.max(5000, backoffUntil - now()) : ONCHAIN_POLL_MS;
+    setTimeout(loop, wait);
   };
   loop();
 }
