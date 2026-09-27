@@ -15,6 +15,8 @@ import {
   createLivePosition,
   canOpenMorePositions,
   openPositionCount,
+  hasOpenPositionForMint,
+  openPositionIdForMint,
   tradingMode,
 } from '../db/positions.js';
 import { createTradeIntent } from '../db/intents.js';
@@ -40,6 +42,12 @@ export async function processCandidateFromSignals(signalPayload) {
   }
 
   const mint = signalPayload.mint;
+  // 1 posisi terbuka per token — jangan beli ganda selama posisi lama masih hold
+  if (hasOpenPositionForMint(mint)) {
+    const pid = openPositionIdForMint(mint);
+    console.log(`[agent] already holding ${mint.slice(0, 10)}… (#${pid}), skip duplicate`);
+    return;
+  }
   const signalKey = `${mint}:${signalPayload.route || 'x'}:${Math.floor(now() / 300_000)}`;
   if (seenSignalCandidates.has(signalKey)) return;
   seenSignalCandidates.set(signalKey, now());
@@ -178,6 +186,24 @@ export async function processCandidateFromSignals(signalPayload) {
 export async function handleApprovedBuy(selectedRow, decision, batchId, rows = [], triggerCandidateId = null) {
   const mode = tradingMode();
   const strat = activeStrategy();
+
+  // Guard ulang tepat sebelum eksekusi (race dengan signal berikutnya)
+  const mintCheck = selectedRow?.candidate?.token?.mint;
+  if (mintCheck && hasOpenPositionForMint(mintCheck)) {
+    console.log(`[agent] skip buy ${mintCheck.slice(0, 10)}… — already open #${openPositionIdForMint(mintCheck)}`);
+    logDecisionEvent({
+      batchId,
+      triggerCandidateId,
+      selectedRow,
+      rows,
+      decision,
+      mode,
+      action: 'entry_skipped_duplicate_mint',
+      strategyId: strat.id,
+      guardrails: { openPositionId: openPositionIdForMint(mintCheck) },
+    });
+    return;
+  }
 
   const freshSelectedRow = await refreshCandidateForExecution(selectedRow);
 
