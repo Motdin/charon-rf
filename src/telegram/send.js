@@ -15,6 +15,16 @@ import { gmgnWeightStatus } from '../enrichment/gmgn.js';
 import { addSavedWallet, removeSavedWallet, listSavedWallets } from '../enrichment/wallets.js';
 import { checkTokenSecurity, summarizeSecurity } from '../enrichment/security.js';
 import {
+  parseWindow,
+  collectClosedTrades,
+  generateLessons,
+  storeLessons,
+  listLessons,
+  archiveLesson,
+  deleteLesson,
+  formatLearnReport,
+} from '../learning/lessons.js';
+import {
   handleStratSet,
   formatStrategyCard,
   formatFieldEditor,
@@ -137,6 +147,9 @@ function helpText() {
     '/walletadd &lt;label&gt; &lt;0x…&gt; — track a wallet',
     '/walletremove &lt;label|0x…&gt; — stop tracking',
     '/security &lt;0x mint&gt; — run rug/honeypot check',
+    '/learn [1h|24h|7d] — LLM analyze closed trades → store lessons',
+    '/lessons — list active lessons',
+    '/lessondel &lt;id&gt; — delete lesson',
     '/filters — active strategy thresholds',
     '/confirm &lt;intent_id&gt; — approve pending intent',
     '/reject &lt;intent_id&gt; — reject pending intent',
@@ -572,6 +585,52 @@ export function startTelegramBot() {
             } catch (err) {
               await sendTelegram(`❌ ${escapeHtml(err.message)}`, { parse_mode: 'HTML' });
             }
+            break;
+          }
+
+          case '/learn': {
+            const { windowMs, label } = parseWindow(args[0] || '24h');
+            await sendTelegram(`📚 Menganalisa trade ${escapeHtml(label)}…`);
+            try {
+              const trades = collectClosedTrades(windowMs);
+              const result = await generateLessons(trades);
+              const ids = storeLessons(result.lessons, {
+                window: label,
+                windowMs,
+                tradeCount: trades.length,
+                summary: result.summary,
+              });
+              await sendTelegram(formatLearnReport(result, `${label} · ids ${ids.join(',') || '-'}`));
+            } catch (err) {
+              await sendTelegram(`❌ learn gagal: ${escapeHtml(err.message)}`, { parse_mode: 'HTML' });
+            }
+            break;
+          }
+
+          case '/lessons': {
+            const rows = listLessons('active', 15);
+            if (!rows.length) {
+              await sendTelegram('Belum ada lesson. Jalankan <code>/learn 24h</code>', { parse_mode: 'HTML' });
+              break;
+            }
+            const lines = rows.map(
+              (r) => `#${r.id} <b>${escapeHtml(r.lesson.slice(0, 180))}</b>\n   <i>${escapeHtml(String(r.evidence?.evidence || r.evidence?.severity || ''))}</i>`
+            );
+            await sendTelegram(
+              [`<b>Active lessons</b> (${rows.length})`, '', ...lines, '', 'Hapus: <code>/lessondel &lt;id&gt;</code>'].join('\n'),
+              { parse_mode: 'HTML' }
+            );
+            break;
+          }
+
+          case '/lessondel': {
+            const id = Number(args[0]);
+            if (!id) {
+              await sendTelegram('Usage: <code>/lessondel &lt;id&gt;</code>', { parse_mode: 'HTML' });
+              break;
+            }
+            const ok = deleteLesson(id) || archiveLesson(id);
+            await sendTelegram(ok ? `Lesson #${id} dihapus/diarsipkan.` : `Lesson #${id} tidak ditemukan.`);
             break;
           }
 
