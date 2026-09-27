@@ -4,7 +4,8 @@ import { promisify } from 'node:util';
 import { existsSync, mkdirSync, unlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { positionById, allPositions, closedPositions, openPositions, tradingMode, allPositions as listAllPositions } from '../db/positions.js';
+import { positionById, allPositions, closedPositions, openPositions, tradingMode } from '../db/positions.js';
+import { db } from '../db/connection.js';
 import { intentById, pendingIntents, updateIntentStatus } from '../db/intents.js';
 import { activeStrategy, allStrategies, strategyById, setActiveStrategy, updateStrategyConfig, numSetting, setSetting, boolSetting } from '../db/settings.js';
 import { candidateSummary, positionSummary } from './format.js';
@@ -48,7 +49,15 @@ export async function sendTelegram(html) {
       disable_web_page_preview: true,
     });
   } catch (err) {
-    console.log(`[tg] send failed: ${err.message}`);
+    const code = err?.response?.body?.error_code || '';
+    const desc = err?.response?.body?.description || err.message;
+    if (/chat not found/i.test(desc)) {
+      console.log(`[tg] send failed: chat not found — TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID} salah. Jalankan: npm run tg-diag`);
+    } else if (/bot was blocked|kicked|not a member/i.test(desc)) {
+      console.log(`[tg] send failed: bot diblokir/keluar dari chat — unblock/bot ke grup, lalu tg-diag`);
+    } else {
+      console.log(`[tg] send failed: ${code ? code + ' ' : ''}${desc}`);
+    }
     return null;
   }
 }
@@ -142,7 +151,8 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = join(__dirname, '..', '..');
 
 function resolvePython() {
-  return process.env.MIMO_PYTHON || 'python';
+  // VPS sering tidak punya `python` — coba beberapa nama
+  return process.env.MIMO_PYTHON || process.env.PYTHON || 'python3';
 }
 
 function parseDateArg(args) {
@@ -152,80 +162,132 @@ function parseDateArg(args) {
   return date || new Date().toISOString().slice(0, 10);
 }
 
+function dayRangeMs(dateStr) {
+  const start = Date.parse(`${dateStr}T00:00:00.000Z`);
+  return [start, start + 24 * 3600_000];
+}
+
 /**
- * Generate daily PnL card via scripts/render_pnl_card.py
+ * Text PnL card — pure Node, no Python required.
  */
-async function generatePnlCard({ date, textOnly = false }) {
+export function buildTextPnlCard(dateStr) {
+  const [startMs, endMs] = dayRangeMs(dateStr);
+  const rows = db
+    .prepare(
+      `SELECT id, symbol, mint, pnl_percent, pnl_eth, exit_reason, strategy_id, execution_mode
+       FROM dry_run_positions
+       WHERE status = 'closed' AND closed_at_ms IS NOT NULL AND closed_at_ms >= ? AND closed_at_ms < ?
+       ORDER BY closed_at_ms ASC`
+    )
+    .all(startMs, endMs);
+  const openCount = db.prepare("SELECT COUNT(*) AS c FROM dry_run_positions WHERE status = 'open'").get().c;
+
+  const wins = rows.filter((r) => Number(r.pnl_percent || 0) > 0);
+  const losses = rows.filter((r) => Number(r.pnl_percent || 0) <= 0);
+  const netPct = rows.reduce((a, r) => a + Number(r.pnl_percent || 0), 0);
+  const netEth = rows.reduce((a, r) => a + Number(r.pnl_eth || 0), 0);
+  const winRate = rows.length ? (wins.length / rows.length) * 100 : 0;
+  const best = rows.length
+    ? rows.reduce((a, b) => (Number(b.pnl_percent || 0) > Number(a.pnl_percent || 0) ? b : a))
+    : null;
+  const worst = rows.length
+    ? rows.reduce((a, b) => (Number(b.pnl_percent || 0) < Number(a.pnl_percent || 0) ? b : a))
+    : null;
+  const strategies = [...new Set(rows.map((r) => r.strategy_id).filter(Boolean))];
+  const modes = [...new Set(rows.map((r) => r.execution_mode).filter(Boolean))];
+  const fmtPct = (v) => `${Number(v) >= 0 ? '+' : ''}${Number(v).toFixed(1)}%`;
+  const fmtEth = (v) => `${Number(v) >= 0 ? '+' : ''}${Number(v).toFixed(4)} ETH`;
+  const emoji = netPct >= 0 ? '🟢' : '🔴';
+
+  return [
+    `${emoji} ${dateStr} · CHARON-RH`,
+    `Net PnL: ${fmtPct(netPct)} (${fmtEth(netEth)})`,
+    `Win rate: ${winRate.toFixed(1)}% (${wins.length}W / ${losses.length}L)`,
+    `Trades: ${rows.length}  ·  Open: ${openCount}`,
+    best?.symbol ? `Best: ${best.symbol} ${fmtPct(best.pnl_percent)}` : 'Best: —',
+    worst?.symbol ? `Worst: ${worst.symbol} ${fmtPct(worst.pnl_percent)}` : 'Worst: —',
+    strategies.length ? `Strategy: ${strategies.join(', ')}` : '',
+    modes.length ? `Mode: ${modes.join(', ')}` : '',
+    '',
+    'not financial advice · dry-run first',
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+/**
+ * PNG PnL card via scripts/render_pnl_card.py (needs Python + Pillow).
+ */
+async function generatePnlCardPng({ date }) {
   const dbPath = join(PROJECT_ROOT, process.env.DB_PATH || './charon-rh.sqlite');
   const outDir = join(PROJECT_ROOT, 'tmp');
   if (!existsSync(outDir)) mkdirSync(outDir, { recursive: true });
   const outPath = join(outDir, `pnl_card_${date}.png`);
-
   const script = join(PROJECT_ROOT, 'scripts', 'render_pnl_card.py');
-  const args = [script, '--db', dbPath, '--date', date];
-  if (textOnly) args.push('--text');
-  else args.push('--out', outPath);
 
-  const { stdout } = await execFileAsync(resolvePython(), args, {
+  const { stdout } = await execFileAsync(resolvePython(), [script, '--db', dbPath, '--date', date, '--out', outPath], {
     cwd: PROJECT_ROOT,
     maxBuffer: 4 * 1024 * 1024,
   });
 
-  if (textOnly) return { text: stdout.trim(), outPath: null };
-
-  // JSON line is last
   const lines = stdout.trim().split('\n');
-  const last = lines[lines.length - 1];
   let parsed = {};
   try {
-    parsed = JSON.parse(last);
+    parsed = JSON.parse(lines[lines.length - 1]);
   } catch {
-    parsed = { ok: true, out: outPath, text: last };
+    parsed = { ok: true, out: outPath };
   }
-  return { ...parsed, outPath: parsed.out || outPath, text: parsed.text || '' };
+  return { ...parsed, outPath: parsed.out || outPath };
 }
 
 async function handlePnlCard(chatId, args, bot) {
   const textOnly = args.some((a) => a.toLowerCase() === 'text');
   const date = parseDateArg(args);
+  const text = buildTextPnlCard(date);
 
+  // Text card — selalu bisa, tanpa Python
+  if (textOnly) {
+    await bot.sendMessage(
+      chatId,
+      `📋 <b>PnL text card</b> — ${escapeHtml(date)}\n\n<pre>${escapeHtml(text)}</pre>\n\nCopy ke X / Twitter.`,
+      { parse_mode: 'HTML' }
+    );
+    return;
+  }
+
+  // PNG card — butuh Python + Pillow
   try {
-    if (textOnly) {
-      const result = await generatePnlCard({ date, textOnly: true });
-      await bot.sendMessage(
-        chatId,
-        `📋 <b>PnL text card</b> — ${escapeHtml(date)}\n\n<pre>${escapeHtml(result.text)}</pre>\n\nCopy ke X / Twitter.`,
-        { parse_mode: 'HTML' }
-      );
-      return;
-    }
-
-    const result = await generatePnlCard({ date, textOnly: false });
+    const result = await generatePnlCardPng({ date });
     if (!result.outPath || !existsSync(result.outPath)) {
-      return bot.sendMessage(chatId, `❌ Gagal render kartu PnL untuk ${date}.`);
+      throw new Error('PNG tidak terbentuk');
     }
-
     await bot.sendPhoto(chatId, result.outPath, {
-      caption: [
-        `📊 <b>Daily PnL card</b> — ${escapeHtml(date)}`,
-        result.text ? `\n<pre>${escapeHtml(result.text)}</pre>` : '',
-        '\nSiap diunggah ke X.',
-      ].join(''),
+      caption: `📊 <b>Daily PnL card</b> — ${escapeHtml(date)}\n\n<pre>${escapeHtml(text)}</pre>\n\nSiap diunggah ke X.`,
       parse_mode: 'HTML',
     });
-
-    // cleanup temp png (keep last one for debug is fine, but free space)
     try {
       unlinkSync(result.outPath);
     } catch {
       /* ignore */
     }
   } catch (err) {
-    console.log(`[tg] pnlcard error: ${err.message}`);
-    // fallback: inline text card from sqlite via node
-    await bot.sendMessage(chatId, `❌ Render card gagal: ${escapeHtml(err.message)}\nGunakan /pnl untuk ringkasan teks.`, {
-      parse_mode: 'HTML',
-    });
+    const msg = String(err.message || err);
+    const noPython = /ENOENT|python|not recognized|ModuleNotFound|Pillow/i.test(msg);
+    await bot.sendMessage(
+      chatId,
+      [
+        noPython ? '⚠️ <b>PNG butuh Python + Pillow</b> di VPS.' : `❌ Render PNG gagal: ${escapeHtml(msg.slice(0, 120))}`,
+        '',
+        `Install: <code>apt install python3 python3-pip -y &amp;&amp; pip3 install pillow</code>`,
+        `Lalu: <code>pm2 restart charon-rh</code>`,
+        '',
+        '<b>Sementara pakai text card:</b>',
+        `<code>/pnlcard text</code>`,
+        '',
+        `<pre>${escapeHtml(text)}</pre>`,
+      ].join('\n'),
+      { parse_mode: 'HTML' }
+    );
   }
 }
 
