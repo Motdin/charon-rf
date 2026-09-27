@@ -13,6 +13,8 @@ export function signalLabel(meta = {}) {
     meta.hasNewPool ? 'new' : null,
     meta.hasTrending ? 'trending' : null,
     meta.hasOnchain ? 'onchain' : null,
+    meta.hasLaunchpad ? 'pons' : null,
+    meta.hasGraduated ? 'graduated' : null,
   ]
     .filter(Boolean)
     .join('+') || meta.route || 'unknown';
