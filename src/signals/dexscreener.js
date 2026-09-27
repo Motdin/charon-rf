@@ -217,7 +217,8 @@ export function ingestPairSignal(signal) {
 async function maybeTrigger(mint, signalMeta) {
   if (!candidateHandler) return;
   const strat = activeStrategy();
-  const sourceCount = signalMeta.sourceCount || 1;
+  // minimal 1 — token yang sampai sini pasti terdeteksi oleh setidaknya satu sumber
+  const sourceCount = Math.max(Number(signalMeta.sourceCount) || 0, signalMeta.hasVolumeSpike ? 1 : 0, 1);
   if (sourceCount < (strat.min_source_count || 1)) return;
   if (strat.require_volume_spike && !signalMeta.hasVolumeSpike) return;
 
@@ -229,7 +230,7 @@ async function maybeTrigger(mint, signalMeta) {
   await candidateHandler({
     mint,
     route: signalMeta.route,
-    signalMeta,
+    signalMeta: { ...signalMeta, sourceCount },
     trendingToken: trending.get(mint) || null,
     volumeSpike: volumeSpikes.get(mint) || null,
     newPool: newPools.get(mint) || null,
