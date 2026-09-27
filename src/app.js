@@ -1,5 +1,5 @@
 import { validateConfig, APP_NAME, CHAIN_ID, RPC_URL, GMGN_ENABLED, GMGN_API_KEY } from './config.js';
-import { initDb } from './db/connection.js';
+import { initDb, syncStrategySeeds } from './db/connection.js';
 import { tradingMode } from './db/positions.js';
 import { activeStrategy, numSetting } from './db/settings.js';
 import { startDexScreenerPolling, setCandidateHandler } from './signals/dexscreener.js';
@@ -24,6 +24,8 @@ import { gmgnWeightStatus } from './enrichment/gmgn.js';
 export async function startCharon() {
   validateConfig();
   initDb();
+  // Samakan config strategi dengan seed terbaru di kode (tanpa ubah enabled)
+  syncStrategySeeds();
 
   const strat = activeStrategy();
   console.log(`[${APP_NAME}] starting on chain ${CHAIN_ID} via ${RPC_URL}`);
