@@ -134,10 +134,23 @@ export async function buildCandidate({ mint, route, signalMeta, trendingToken, v
   const enriched = await enrichToken(mint);
   const m = enriched.metrics;
 
-  const sourceCount =
-    signalMeta?.sourceCount ||
-    [signalMeta?.hasVolumeSpike, signalMeta?.hasNewPool, signalMeta?.hasTrending, signalMeta?.hasOnchain].filter(Boolean)
-      .length;
+  // sourceCount: JANGAN pakai `||` — 0 adalah nilai valid tapi harus dihitung ulang dari flags
+  const flagCount = [
+    signalMeta?.hasVolumeSpike,
+    signalMeta?.hasNewPool,
+    signalMeta?.hasTrending,
+    signalMeta?.hasOnchain,
+    signalMeta?.hasLaunchpad,
+    signalMeta?.hasGraduated,
+  ].filter(Boolean).length;
+
+  const declared = Number(signalMeta?.sourceCount);
+  const sourceCount = Math.max(
+    Number.isFinite(declared) ? declared : 0,
+    flagCount,
+    // kandidat yang sampai ke sini sudah pasti berasal dari minimal satu sumber sinyal
+    1
+  );
 
   const signals = {
     route: route || signalMeta?.route || 'unknown',
