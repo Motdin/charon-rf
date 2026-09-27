@@ -142,12 +142,14 @@ export async function processCandidateFromSignals(signalPayload) {
 
   if (batchId) await sendBatchReveal(batchId, rows, batchDecision, candidateId);
 
-  const minConfidence = numSetting('llm_min_confidence', 75);
+  // Threshold dari strategi aktif dulu, fallback ke setting global
+  const minConfidence =
+    Number(strat.llm_min_confidence) || numSetting('llm_min_confidence', 75);
   const approved =
     selectedRow &&
     boolSetting('agent_enabled', true) &&
     batchDecision.verdict === 'BUY' &&
-    batchDecision.confidence >= minConfidence;
+    Number(batchDecision.confidence) >= minConfidence;
 
   if (approved) {
     if (!canOpenMorePositions()) {
@@ -159,8 +161,21 @@ export async function processCandidateFromSignals(signalPayload) {
         decision: batchDecision,
         action: 'entry_skipped_max_positions',
         strategyId: strat.id,
-        guardrails: { maxOpenPositions: numSetting('max_open_positions', 3), openPositions: openPositionCount() },
+        guardrails: {
+          maxOpenPositions: strat.max_open_positions ?? numSetting('max_open_positions', 3),
+          openPositions: openPositionCount(),
+          confidence: batchDecision.confidence,
+          minConfidence,
+        },
       });
+      // Beri tahu user via Telegram — jangan diam saat slot penuh
+      await sendTelegram([
+        `🛑 <b>BUY ditolak — slot penuh</b>`,
+        `Conf ${batchDecision.confidence} ≥ min ${minConfidence} ✓`,
+        `Posisi: ${openPositionCount()}/${strat.max_open_positions ?? numSetting('max_open_positions', 3)}`,
+        '',
+        candidateSummary(selectedRow.candidate, batchDecision),
+      ].join('\n'));
       return;
     }
     await handleApprovedBuy(selectedRow, batchDecision, batchId, rows, candidateId);
@@ -176,10 +191,24 @@ export async function processCandidateFromSignals(signalPayload) {
       guardrails: {
         agentEnabled: boolSetting('agent_enabled', true),
         confidenceThreshold: minConfidence,
+        actualConfidence: batchDecision.confidence,
+        verdict: batchDecision.verdict,
         openPositions: openPositionCount(),
-        maxOpenPositions: numSetting('max_open_positions', 3),
+        maxOpenPositions: strat.max_open_positions ?? numSetting('max_open_positions', 3),
       },
     });
+    // Log alasan penolakan ke Telegram agar tidak terlihat "freeze"
+    if (selectedRow && batchDecision.verdict === 'BUY') {
+      const why =
+        Number(batchDecision.confidence) < minConfidence
+          ? `conf ${batchDecision.confidence} < min ${minConfidence}`
+          : !boolSetting('agent_enabled', true)
+            ? 'agent OFF'
+            : 'other guard';
+      await sendTelegram(
+        `🟡 <b>BUY tidak dieksekusi</b>\n${escapeHtml(why)}\n\n${candidateSummary(selectedRow.candidate, batchDecision)}`
+      );
+    }
   }
 }
 
