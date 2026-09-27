@@ -11,7 +11,8 @@ export function openPositionCount() {
 }
 
 export function canOpenMorePositions() {
-  const max = numSetting('max_open_positions', 3);
+  const strat = activeStrategy();
+  const max = strat.max_open_positions ?? numSetting('max_open_positions', 3);
   return openPositionCount() < max;
 }
 
