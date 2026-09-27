@@ -445,7 +445,7 @@ export function startTelegramBot() {
                 `<b>${APP_NAME} status</b>`,
                 `Mode: <b>${tradingMode()}</b>`,
                 `Strategy: <b>${strat.id}</b> (${strat.name})`,
-                `Open positions: ${opens}/${numSetting('max_open_positions', 3)}`,
+                `Open positions: ${opens}/${activeStrategy().max_open_positions ?? numSetting('max_open_positions', 3)}`,
                 `Agent: ${boolSetting('agent_enabled', true) ? 'ON' : 'OFF'}`,
                 gmgnLine,
               ].join('\n')
@@ -735,7 +735,7 @@ export function startTelegramBot() {
                   `<b>${APP_NAME} status</b>`,
                   `Mode: <b>${tradingMode()}</b>`,
                   `Strategy: <b>${strat.id}</b>`,
-                  `Open: ${openPositions().length}/${numSetting('max_open_positions', 3)}`,
+                  `Open: ${openPositions().length}/${activeStrategy().max_open_positions ?? numSetting('max_open_positions', 3)}`,
                   w.enabled ? `GMGN weight ${w.spent}/${w.budget}` : 'GMGN off',
                 ].join('\n'),
                 { parse_mode: 'HTML', reply_markup: mainMenuKeyboard() }
