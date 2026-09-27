@@ -151,8 +151,8 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = join(__dirname, '..', '..');
 
 function resolvePython() {
-  // VPS sering tidak punya `python` — coba beberapa nama
-  return process.env.MIMO_PYTHON || process.env.PYTHON || 'python3';
+  // VPS (Debian/Ubuntu) biasanya `python3`; Windows dev `python`
+  return process.env.PYTHON || process.env.MIMO_PYTHON || 'python3';
 }
 
 function parseDateArg(args) {
@@ -272,17 +272,30 @@ async function handlePnlCard(chatId, args, bot) {
     }
   } catch (err) {
     const msg = String(err.message || err);
-    const noPython = /ENOENT|python|not recognized|ModuleNotFound|Pillow/i.test(msg);
+    // Hanya anggap "python hilang" jika benar-benar binary tidak ditemukan.
+    // JANGAN match substring "python" — err.message selalu memuat nama command.
+    const noPython =
+      /ENOENT/i.test(msg) ||
+      /command not found/i.test(msg) ||
+      /not recognized as an internal or external/i.test(msg) ||
+      /No module named/i.test(msg);
+
+    const realError = msg.replace(/^Command failed:.*?python3?\s+/i, '').split('\n').slice(0, 4).join(' · ');
+
     await bot.sendMessage(
       chatId,
       [
-        noPython ? '⚠️ <b>PNG butuh Python + Pillow</b> di VPS.' : `❌ Render PNG gagal: ${escapeHtml(msg.slice(0, 120))}`,
+        noPython
+          ? '⚠️ <b>Python tidak ditemukan</b> — PNG card butuh python3 + Pillow.'
+          : `⚠️ <b>Render PNG gagal</b>: <code>${escapeHtml(realError.slice(0, 200))}</code>`,
         '',
-        `Install: <code>apt install python3 python3-pip -y &amp;&amp; pip3 install pillow</code>`,
-        `Lalu: <code>pm2 restart charon-rh</code>`,
+        noPython ? 'Install:' : 'Cek dependency:',
+        '<code>apt install -y python3 python3-pil</code>',
+        '<code>python3 -c "from PIL import Image; print(1)"</code>',
+        '<code>pm2 restart charon-rh</code>',
         '',
-        '<b>Sementara pakai text card:</b>',
-        `<code>/pnlcard text</code>`,
+        '<b>Text card (tanpa Python) tetap jalan:</b>',
+        '<code>/pnlcard text</code>',
         '',
         `<pre>${escapeHtml(text)}</pre>`,
       ].join('\n'),
