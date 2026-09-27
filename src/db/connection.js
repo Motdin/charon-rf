@@ -1,5 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
 import { DB_PATH } from '../config.js';
+import { STRATEGY_SEEDS, STRATEGY_META } from './strategySeeds.js';
 
 export const db = new DatabaseSync(DB_PATH);
 
@@ -9,145 +10,24 @@ export function ensureColumn(table, column, ddl) {
 }
 
 /**
- * Update config_json strategi dari seed terbaru — TANPA mengubah flag enabled.
- * Dipanggil setiap boot supaya perubahan default di kode ikut berlaku,
- * meski DB sudah ada (INSERT OR IGNORE tidak menimpa row lama).
+ * NONAKTIF secara default.
+ * Dulu dipanggil tiap boot dan menimpa /stratset user.
+ * Aktifkan hanya jika FORCE_SYNC_STRATEGIES=1 (mis. saat migrasi seed baru).
  */
-export function syncStrategySeeds() {
-  const seeds = {
-    sniper: {
-      entry_mode: 'immediate',
-      min_source_count: 2,
-      require_volume_spike: true,
-      pool_age_max_ms: 6 * 3600_000,
-      min_mcap_usd: 5000,
-      max_mcap_usd: 500000,
-      min_liquidity_usd: 5000,
-      min_volume_h24_usd: 10000,
-      min_txns_h24: 50,
-      max_top10_holder_percent: 60,
-      min_holders: 20,
-      max_ath_distance_pct: 0,
-      trending_min_volume_usd: 5000,
-      max_rug_score: 0.5,
-      require_security_pass: true,
-      max_security_risk: 0.5,
-      min_saved_wallet_holders: 0,
-      max_insider_count: 3,
-      max_sniper_share_percent: 30,
-      position_size_eth: 0.05,
-      max_open_positions: 3,
-      tp_percent: 50,
-      sl_percent: -25,
-      trailing_enabled: true,
-      trailing_percent: 20,
-      partial_tp: false,
-      partial_tp_at_percent: 0,
-      partial_tp_sell_percent: 0,
-      max_hold_ms: 0,
-      use_llm: true,
-      llm_min_confidence: 50,
-    },
-    dip_buy: {
-      entry_mode: 'wait_for_dip',
-      min_source_count: 1,
-      require_volume_spike: false,
-      pool_age_max_ms: 7 * 86400_000,
-      min_mcap_usd: 20000,
-      max_mcap_usd: 2000000,
-      min_liquidity_usd: 15000,
-      min_volume_h24_usd: 5000,
-      min_txns_h24: 20,
-      max_top10_holder_percent: 70,
-      min_holders: 50,
-      max_ath_distance_pct: -35,
-      trending_min_volume_usd: 0,
-      max_rug_score: 0.5,
-      require_security_pass: true,
-      max_security_risk: 0.5,
-      min_saved_wallet_holders: 0,
-      max_insider_count: 3,
-      max_sniper_share_percent: 35,
-      position_size_eth: 0.03,
-      max_open_positions: 3,
-      tp_percent: 30,
-      sl_percent: -20,
-      trailing_enabled: true,
-      trailing_percent: 15,
-      partial_tp: false,
-      use_llm: true,
-      llm_min_confidence: 60,
-    },
-    smart_money: {
-      entry_mode: 'immediate',
-      min_source_count: 2,
-      require_volume_spike: false,
-      pool_age_max_ms: 7 * 86400_000,
-      min_mcap_usd: 15000,
-      max_mcap_usd: 5000000,
-      min_liquidity_usd: 25000,
-      min_volume_h24_usd: 25000,
-      min_txns_h24: 150,
-      max_top10_holder_percent: 45,
-      min_holders: 200,
-      max_ath_distance_pct: 0,
-      trending_min_volume_usd: 15000,
-      max_rug_score: 0.3,
-      require_security_pass: true,
-      max_security_risk: 0.35,
-      min_saved_wallet_holders: 1,
-      max_insider_count: 1,
-      max_sniper_share_percent: 20,
-      position_size_eth: 0.05,
-      max_open_positions: 3,
-      tp_percent: 100,
-      sl_percent: -25,
-      trailing_enabled: false,
-      partial_tp: true,
-      partial_tp_at_percent: 100,
-      partial_tp_sell_percent: 50,
-      use_llm: true,
-      llm_min_confidence: 70,
-    },
-    degen: {
-      entry_mode: 'immediate',
-      min_source_count: 1,
-      require_volume_spike: false,
-      pool_age_max_ms: 24 * 3600_000,
-      min_mcap_usd: 0,
-      max_mcap_usd: 250000,
-      min_liquidity_usd: 0,
-      min_volume_h24_usd: 0,
-      min_txns_h24: 0,
-      max_top10_holder_percent: 85,
-      min_holders: 0,
-      max_ath_distance_pct: 0,
-      trending_min_volume_usd: 0,
-      max_rug_score: 0.85,
-      require_security_pass: false,
-      max_security_risk: 0.9,
-      min_saved_wallet_holders: 0,
-      max_insider_count: 99,
-      max_sniper_share_percent: 90,
-      position_size_eth: 0.02,
-      max_open_positions: 5,
-      tp_percent: 30,
-      sl_percent: -15,
-      trailing_enabled: true,
-      trailing_percent: 10,
-      partial_tp: false,
-      partial_tp_at_percent: 0,
-      partial_tp_sell_percent: 0,
-      max_hold_ms: 3600_000,
-      use_llm: false,
-      llm_min_confidence: 0,
-    },
-  };
-
-  const update = db.prepare('UPDATE strategies SET config_json = ? WHERE id = ?');
-  for (const [id, config] of Object.entries(seeds)) {
-    update.run(JSON.stringify(config), id);
+export function syncStrategySeeds(force = false) {
+  const enabled = force || process.env.FORCE_SYNC_STRATEGIES === '1';
+  if (!enabled) {
+    console.log('[strategies] sync skipped — /stratset persists (set FORCE_SYNC_STRATEGIES=1 to force)');
+    return { synced: 0 };
   }
+  const update = db.prepare('UPDATE strategies SET config_json = ? WHERE id = ?');
+  let n = 0;
+  for (const [id, config] of Object.entries(STRATEGY_SEEDS)) {
+    update.run(JSON.stringify(config), id);
+    n++;
+  }
+  console.log(`[strategies] synced ${n} strategies from seed`);
+  return { synced: n };
 }
 
 export function initDb() {
@@ -334,13 +214,13 @@ function seedDefaults() {
     trading_mode: process.env.TRADING_MODE || 'dry_run',
     llm_candidate_pick_count: process.env.LLM_CANDIDATE_PICK_COUNT || '10',
     llm_candidate_max_age_ms: process.env.LLM_CANDIDATE_MAX_AGE_MS || '600000',
-    llm_min_confidence: '75',
-    max_open_positions: process.env.MAX_OPEN_POSITIONS || '3',
+    llm_min_confidence: process.env.LLM_MIN_CONFIDENCE || '60',
+    max_open_positions: process.env.MAX_OPEN_POSITIONS || '10',
     default_tp_percent: '50',
     default_sl_percent: '-25',
     default_trailing_enabled: 'true',
     default_trailing_percent: '20',
-    dry_run_buy_eth: '0.05',
+    dry_run_buy_eth: '0.02',
   };
   for (const [key, value] of Object.entries(defaults)) insertSetting.run(key, value);
 
@@ -348,169 +228,9 @@ function seedDefaults() {
     'INSERT OR IGNORE INTO strategies (id, name, enabled, config_json, created_at_ms) VALUES (?, ?, ?, ?, ?)'
   );
   const ts = Date.now();
-
-  // Sniper: overlap required, early entry, LLM on
-  stratInsert.run(
-    'sniper',
-    'Sniper',
-    1,
-    JSON.stringify({
-      entry_mode: 'immediate',
-      min_source_count: 2,
-      require_volume_spike: true,
-      pool_age_max_ms: 6 * 3600_000,
-      min_mcap_usd: 5000,
-      max_mcap_usd: 500000,
-      min_liquidity_usd: 5000,
-      min_volume_h24_usd: 10000,
-      min_txns_h24: 50,
-      max_top10_holder_percent: 60,
-      min_holders: 20,
-      max_ath_distance_pct: 0,
-      trending_min_volume_usd: 5000,
-      max_rug_score: 0.5,
-      require_security_pass: true,
-      max_security_risk: 0.5,
-      min_saved_wallet_holders: 0,
-      max_insider_count: 3,
-      max_sniper_share_percent: 30,
-      position_size_eth: 0.05,
-      max_open_positions: 3,
-      tp_percent: 50,
-      sl_percent: -25,
-      trailing_enabled: true,
-      trailing_percent: 20,
-      partial_tp: false,
-      partial_tp_at_percent: 0,
-      partial_tp_sell_percent: 0,
-      max_hold_ms: 0,
-      use_llm: true,
-      llm_min_confidence: 50,
-    }),
-    ts
-  );
-
-  // Dip buy: wait for ATH distance
-  stratInsert.run(
-    'dip_buy',
-    'Dip Buy',
-    0,
-    JSON.stringify({
-      entry_mode: 'wait_for_dip',
-      min_source_count: 1,
-      require_volume_spike: false,
-      pool_age_max_ms: 7 * 86400_000,
-      min_mcap_usd: 20000,
-      max_mcap_usd: 2000000,
-      min_liquidity_usd: 15000,
-      min_volume_h24_usd: 5000,
-      min_txns_h24: 20,
-      max_top10_holder_percent: 70,
-      min_holders: 50,
-      max_ath_distance_pct: -35,
-      trending_min_volume_usd: 0,
-      max_rug_score: 0.5,
-      require_security_pass: true,
-      max_security_risk: 0.5,
-      min_saved_wallet_holders: 0,
-      max_insider_count: 3,
-      max_sniper_share_percent: 35,
-      position_size_eth: 0.03,
-      max_open_positions: 3,
-      tp_percent: 30,
-      sl_percent: -20,
-      trailing_enabled: true,
-      trailing_percent: 15,
-      partial_tp: false,
-      partial_tp_at_percent: 0,
-      partial_tp_sell_percent: 0,
-      max_hold_ms: 0,
-      use_llm: true,
-      llm_min_confidence: 60,
-    }),
-    ts
-  );
-
-  // Smart money: holder quality, partial TP, LLM strict
-  stratInsert.run(
-    'smart_money',
-    'Smart Money',
-    0,
-    JSON.stringify({
-      entry_mode: 'immediate',
-      min_source_count: 2,
-      require_volume_spike: false,
-      pool_age_max_ms: 7 * 86400_000,
-      min_mcap_usd: 15000,
-      max_mcap_usd: 5000000,
-      min_liquidity_usd: 25000,
-      min_volume_h24_usd: 25000,
-      min_txns_h24: 150,
-      max_top10_holder_percent: 45,
-      min_holders: 200,
-      max_ath_distance_pct: 0,
-      trending_min_volume_usd: 15000,
-      max_rug_score: 0.3,
-      require_security_pass: true,
-      max_security_risk: 0.35,
-      min_saved_wallet_holders: 1,
-      max_insider_count: 1,
-      max_sniper_share_percent: 20,
-      position_size_eth: 0.05,
-      max_open_positions: 3,
-      tp_percent: 100,
-      sl_percent: -25,
-      trailing_enabled: false,
-      trailing_percent: 0,
-      partial_tp: true,
-      partial_tp_at_percent: 100,
-      partial_tp_sell_percent: 50,
-      max_hold_ms: 0,
-      use_llm: true,
-      llm_min_confidence: 70,
-    }),
-    ts
-  );
-
-  // Degen: rule-based, no LLM
-  stratInsert.run(
-    'degen',
-    'Degen',
-    0,
-    JSON.stringify({
-      entry_mode: 'immediate',
-      min_source_count: 1,
-      require_volume_spike: false,
-      // trench mode: token baru dari launchpad belum punya volume di aggregator
-      pool_age_max_ms: 24 * 3600_000,
-      min_mcap_usd: 0,
-      max_mcap_usd: 250000,
-      min_liquidity_usd: 0,
-      min_volume_h24_usd: 0,
-      min_txns_h24: 0,
-      max_top10_holder_percent: 85,
-      min_holders: 0,
-      max_ath_distance_pct: 0,
-      trending_min_volume_usd: 0,
-      max_rug_score: 0.85,
-      require_security_pass: false,
-      max_security_risk: 0.9,
-      min_saved_wallet_holders: 0,
-      max_insider_count: 99,
-      max_sniper_share_percent: 90,
-      position_size_eth: 0.02,
-      max_open_positions: 5,
-      tp_percent: 30,
-      sl_percent: -15,
-      trailing_enabled: true,
-      trailing_percent: 10,
-      partial_tp: false,
-      partial_tp_at_percent: 0,
-      partial_tp_sell_percent: 0,
-      max_hold_ms: 3600_000,
-      use_llm: false,
-      llm_min_confidence: 0,
-    }),
-    ts
-  );
+  for (const [id, config] of Object.entries(STRATEGY_SEEDS)) {
+    const meta = STRATEGY_META[id] || { name: id, enabled: 0 };
+    stratInsert.run(id, meta.name, meta.enabled, JSON.stringify(config), ts);
+  }
 }
+
