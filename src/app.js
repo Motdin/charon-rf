@@ -24,7 +24,8 @@ import { gmgnWeightStatus } from './enrichment/gmgn.js';
 export async function startCharon() {
   validateConfig();
   initDb();
-  // Samakan config strategi dengan seed terbaru di kode (tanpa ubah enabled)
+  // Sync strategi MATI secara default agar /stratset user tidak ditimpa restart.
+  // Paksa migrasi seed baru dengan: FORCE_SYNC_STRATEGIES=1 pm2 restart charon-rh
   syncStrategySeeds();
 
   const strat = activeStrategy();
