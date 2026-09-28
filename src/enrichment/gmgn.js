@@ -30,6 +30,8 @@ const WEIGHT_COST = {
 
 const cache = new Map();
 let lastRequestAt = 0;
+/** Endpoint yang diketahui 404 di OpenAPI — jangan dipanggil ulang. */
+const endpointDead = new Set();
 let queue = Promise.resolve();
 const backoff = { until: 0, reason: '' };
 
@@ -135,6 +137,13 @@ async function gmgnFetch(pathname, { params = {}, weightKind = 'tokenInfo' } = {
     if (res.ok) return payload;
 
     const message = `${res.status} ${payload?.code || ''} ${payload?.message || payload?.error || text}`.trim();
+    if (res.status === 404) {
+      endpointDead.add(pathname);
+      const err404 = new Error(`GMGN endpoint missing (404): ${pathname}`);
+      err404.code = 'GMGN_ENDPOINT_MISSING';
+      err404.response = { status: 404, data: payload };
+      throw err404;
+    }
     const rateLimited = res.status === 429 || /rate limit|weight|quota|temporarily/i.test(message);
 
     if (rateLimited || res.status === 403) {
@@ -253,6 +262,7 @@ export async function fetchGmgnHolders(mint, limit = 20, { useCache = true } = {
   const hit = cache.get(key);
   if (useCache && hit && now() - hit.at < GMGN_CACHE_TTL_MS) return hit.value;
   if (!gmgnAvailable()) return null;
+  if (endpointDead.has('/v1/token/holders')) return null;
 
   try {
     const payload = await gmgnFetch('/v1/token/holders', {
@@ -297,6 +307,7 @@ export async function fetchGmgnHolders(mint, limit = 20, { useCache = true } = {
     cache.set(key, { at: now(), value });
     return value;
   } catch (err) {
+    if (err.code === 'GMGN_ENDPOINT_MISSING') return null;
     if (err.code === 'GMGN_WEIGHT_EXHAUSTED' || err.code === 'GMGN_BACKOFF') return null;
     console.log(`[gmgn] holders ${err.message}`);
     cache.set(key, { at: now(), value: null });
@@ -313,6 +324,7 @@ export async function fetchGmgnCandles(mint, { interval = '15m', limit = 48, use
   const hit = cache.get(key);
   if (useCache && hit && now() - hit.at < GMGN_CACHE_TTL_MS) return hit.value;
   if (!gmgnAvailable()) return [];
+  if (endpointDead.has('/v1/market/candles') || endpointDead.has('/v1/candles')) return [];
 
   try {
     const payload = await gmgnFetch('/v1/market/candles', {
@@ -343,11 +355,39 @@ export async function fetchGmgnCandles(mint, { interval = '15m', limit = 48, use
     cache.set(key, { at: now(), value: candles });
     return candles;
   } catch (err) {
+    if (err.code === 'GMGN_ENDPOINT_MISSING') return [];
     if (err.code === 'GMGN_WEIGHT_EXHAUSTED' || err.code === 'GMGN_BACKOFF') return [];
     console.log(`[gmgn] candles ${err.message}`);
     cache.set(key, { at: now(), value: [] });
     return [];
   }
+}
+
+/** Token security — path valid di OpenAPI (/v1/token/security). */
+export async function fetchGmgnSecurity(mint, { useCache = true } = {}) {
+  const key = `sec:${normalizeAddress(mint)}`;
+  const hit = cache.get(key);
+  if (useCache && hit && now() - hit.at < GMGN_CACHE_TTL_MS) return hit.value;
+  if (!gmgnAvailable()) return null;
+  if (endpointDead.has('/v1/token/security')) return null;
+  try {
+    const payload = await gmgnFetch('/v1/token/security', {
+      params: { chain: GMGN_CHAIN, address: normalizeAddress(mint) },
+      weightKind: 'tokenInfo',
+    });
+    const data = payload?.data?.data || payload?.data || payload;
+    cache.set(key, { at: now(), value: data });
+    return data;
+  } catch (err) {
+    if (err.code === 'GMGN_ENDPOINT_MISSING') return null;
+    if (err.code === 'GMGN_WEIGHT_EXHAUSTED' || err.code === 'GMGN_BACKOFF') return null;
+    console.log(`[gmgn] security ${err.message}`);
+    return null;
+  }
+}
+
+export function endpointStatus() {
+  return { dead: [...endpointDead] };
 }
 
 /**
