@@ -35,16 +35,28 @@ export function createFailoverHttpClient() {
 }
 
 /** WebSocket client untuk newHeads / logs — gagal fallback ke HTTP-only. */
-export function createWsClient() {
-  const url = WS_URL || 'wss://robinhood.drpc.org';
+export function createWsClient(wsUrl) {
+  const url = String(wsUrl || WS_URL || 'wss://robinhood.drpc.org').replace(/\/+$/, '');
   return createPublicClient({
     chain: CHAIN,
     transport: webSocket(url, {
-      timeout: 20_000,
+      timeout: 15_000,
       keepAlive: true,
       reconnect: true,
     }),
   });
+}
+
+/** Kandidat WSS — urut prioritas (publicnode sering putus di beberapa region). */
+export function wsCandidates() {
+  const envUrl = (WS_URL || '').replace(/\/+$/, '').trim();
+  const list = [
+    envUrl,
+    'wss://robinhood.drpc.org',
+    'wss://robinhood-rpc.publicnode.com',
+    'wss://rpc.ordofi.network',
+  ];
+  return [...new Set(list.filter(Boolean))];
 }
 
 export const publicClient = createFailoverHttpClient();
