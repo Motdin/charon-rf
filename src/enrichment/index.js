@@ -1,7 +1,7 @@
 import { fetchDexPair, trending, volumeSpikes, newPools } from '../signals/dexscreener.js';
 import { onchainActivity, onchainNewPools } from '../signals/uniswapEvents.js';
 import { fetchTokenInfo, fetchHolders, estimateRugScore } from './blockscout.js';
-import { fetchGmgnTokenInfo, gmgnAvailable, gmgnWeightStatus } from './gmgn.js';
+import { fetchGmgnTokenInfo, fetchGmgnHolders, fetchGmgnCandles, summarizeCandles, gmgnAvailable, gmgnWeightStatus } from './gmgn.js';
 import { checkTokenSecurity, summarizeSecurity } from './security.js';
 import { fetchSmartMoneyReport, fetchSavedWalletExposure, evaluateSmartMoney } from './wallets.js';
 import { toNumber, normalizeAddress, firstPositiveNumber, now } from '../utils.js';
@@ -47,10 +47,19 @@ export async function enrichToken(mint) {
 
   // GMGN is primary — try it only if budget allows. On failure we keep going.
   let gmgn = null;
+  let gmgnHolders = null;
+  let gmgnCandleSummary = null;
   let gmgnTried = false;
   if (gmgnAvailable()) {
     gmgnTried = true;
     gmgn = await fetchGmgnTokenInfo(addr);
+    // Holders: prioritas ke-2 — perbaiki min_holders saat Blockscout 0
+    gmgnHolders = await fetchGmgnHolders(addr, 20);
+    // Candles: hanya jika masih ada weight (opsional, hemat free tier)
+    if (gmgnWeightStatus().remaining > 0) {
+      const candles = await fetchGmgnCandles(addr, { interval: '15m', limit: 32 });
+      gmgnCandleSummary = summarizeCandles(candles);
+    }
   }
 
   // Security + smart-money run in parallel after we know the pair
@@ -78,12 +87,9 @@ export async function enrichToken(mint) {
 
   const liquidityUsd = firstPositiveNumber(gmgn?.liquidityUsd, toNumber(dex?.liquidity));
   const volume24h = firstPositiveNumber(gmgn?.volume24hUsd, toNumber(dex?.volume));
-  const holderCount = firstPositiveNumber(
-    gmgn?.holderCount,
-    holdersData?.holderCount,
-    toNumber(tokenInfo?.holders)
-  ) || 0;
-  const top10Percent = toNumber(holdersData?.top10Percent);
+  const holderCount =
+    firstPositiveNumber(gmgnHolders?.holderCount, gmgn?.holderCount, holdersData?.holderCount, toNumber(tokenInfo?.holders)) || 0;
+  const top10Percent = firstPositiveNumber(gmgnHolders?.top10Percent, holdersData?.top10Percent) ?? 0;
   const ageMs = dex?.ageMs ?? (poolMeta?.seenAt ? now() - poolMeta.seenAt : null);
 
   const rugScore = estimateRugScore({
@@ -104,6 +110,8 @@ export async function enrichToken(mint) {
   return {
     dex,
     gmgn,
+    gmgnHolders,
+    gmgnCandleSummary,
     tokenInfo,
     holdersData,
     security,
@@ -114,7 +122,8 @@ export async function enrichToken(mint) {
     sources: {
       primary: gmgn ? 'gmgn' : gmgnTried ? 'gmgn_failed_fallback' : 'gmgn_skipped',
       secondary: dex ? 'dexscreener' : null,
-      holders: holdersData ? 'blockscout' : null,
+      holders: gmgnHolders ? 'gmgn_holders' : holdersData ? 'blockscout' : null,
+      candles: gmgnCandleSummary && gmgnCandleSummary.sample > 0 ? 'gmgn_candles' : null,
       security: security ? 'local_sim' : null,
       smartMoney: smartMoney ? 'blockscout_transfers' : null,
       gmgnWeight: gmgnWeightStatus(),
@@ -125,7 +134,7 @@ export async function enrichToken(mint) {
       liquidityUsd,
       holderCount,
       top10Percent,
-      maxHolderPercent: toNumber(holdersData?.maxHolderPercent),
+      maxHolderPercent: firstPositiveNumber(gmgnHolders?.maxHolderPercent, holdersData?.maxHolderPercent) ?? 0,
       volume24hUsd: volume24h,
       volume5mUsd: toNumber(dex?.volume5m),
       txns24h: toNumber(dex?.swaps),
@@ -134,6 +143,8 @@ export async function enrichToken(mint) {
       priceChange5m: toNumber(dex?.priceChange5m),
       priceChange1h: toNumber(dex?.priceChange1h),
       priceChange24h: toNumber(dex?.priceChange24h),
+      trend15m: gmgnCandleSummary?.trend || null,
+      trendChangePct: gmgnCandleSummary?.changePct ?? null,
       poolAgeMs: ageMs,
       rugScore,
       totalFeeSol: toNumber(gmgn?.totalFeeSol),

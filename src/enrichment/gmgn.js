@@ -25,6 +25,7 @@ const WEIGHT_COST = {
   tokenInfo: 1,
   trending: 1,
   holders: 1,
+  candles: 1,
 };
 
 const cache = new Map();
@@ -241,6 +242,133 @@ export async function fetchGmgnTrending({ limit = 20 } = {}) {
     console.log(`[gmgn] trending ${err.message}`);
     return [];
   }
+}
+
+/**
+ * Top holders — 1 weight. Memperbaiki min_holders saat Blockscout masih 0.
+ * Return { holders: [{address, share}], holderCount, top10Percent, maxHolderPercent }
+ */
+export async function fetchGmgnHolders(mint, limit = 20, { useCache = true } = {}) {
+  const key = `holders:${normalizeAddress(mint)}:${limit}`;
+  const hit = cache.get(key);
+  if (useCache && hit && now() - hit.at < GMGN_CACHE_TTL_MS) return hit.value;
+  if (!gmgnAvailable()) return null;
+
+  try {
+    const payload = await gmgnFetch('/v1/token/holders', {
+      params: { chain: GMGN_CHAIN, address: normalizeAddress(mint), limit },
+      weightKind: 'holders',
+    });
+    const raw =
+      payload?.data?.data?.holders ||
+      payload?.data?.holders ||
+      payload?.holders ||
+      payload?.data?.data ||
+      payload?.data ||
+      [];
+    const list = Array.isArray(raw) ? raw : [];
+    const holders = list.slice(0, limit).map((h) => {
+      const addr = h.address || h.wallet_address || h.holder || h.hash || '';
+      const shareRaw = h.percentage ?? h.percent ?? h.share ?? h.value_percent ?? h.amount_percentage;
+      let share = toNumber(shareRaw);
+      // GMGN kadang 0..1, kadang 0..100
+      if (share > 0 && share <= 1) share = share * 100;
+      return {
+        address: normalizeAddress(addr),
+        balance: toNumber(h.amount ?? h.value ?? h.balance),
+        share,
+      };
+    });
+
+    let top10 = 0;
+    for (let i = 0; i < Math.min(10, holders.length); i++) top10 += holders[i].share || 0;
+
+    const holderCount = toNumber(
+      payload?.data?.data?.holder_count ?? payload?.data?.holder_count ?? payload?.holder_count
+    ) || holders.length;
+
+    const value = {
+      source: 'gmgn',
+      holders,
+      holderCount,
+      top10Percent: Math.round(top10 * 10) / 10,
+      maxHolderPercent: holders[0]?.share || 0,
+    };
+    cache.set(key, { at: now(), value });
+    return value;
+  } catch (err) {
+    if (err.code === 'GMGN_WEIGHT_EXHAUSTED' || err.code === 'GMGN_BACKOFF') return null;
+    console.log(`[gmgn] holders ${err.message}`);
+    cache.set(key, { at: now(), value: null });
+    return null;
+  }
+}
+
+/**
+ * Candlestick / market series — 1 weight. Interval: 1m|5m|15m|1h|4h|1d
+ * Return array [{ts, open, high, low, close, volume}] atau [].
+ */
+export async function fetchGmgnCandles(mint, { interval = '15m', limit = 48, useCache = true } = {}) {
+  const key = `candles:${normalizeAddress(mint)}:${interval}:${limit}`;
+  const hit = cache.get(key);
+  if (useCache && hit && now() - hit.at < GMGN_CACHE_TTL_MS) return hit.value;
+  if (!gmgnAvailable()) return [];
+
+  try {
+    const payload = await gmgnFetch('/v1/market/candles', {
+      params: {
+        chain: GMGN_CHAIN,
+        address: normalizeAddress(mint),
+        interval,
+        limit,
+      },
+      weightKind: 'candles',
+    });
+    const raw =
+      payload?.data?.data?.candles ||
+      payload?.data?.candles ||
+      payload?.candles ||
+      payload?.data?.data ||
+      payload?.data ||
+      [];
+    const rows = Array.isArray(raw) ? raw : [];
+    const candles = rows.map((c) => ({
+      ts: toNumber(c.time ?? c.timestamp ?? c.ts),
+      open: toNumber(c.open ?? c.o),
+      high: toNumber(c.high ?? c.h),
+      low: toNumber(c.low ?? c.l),
+      close: toNumber(c.close ?? c.c),
+      volume: toNumber(c.volume ?? c.v),
+    }));
+    cache.set(key, { at: now(), value: candles });
+    return candles;
+  } catch (err) {
+    if (err.code === 'GMGN_WEIGHT_EXHAUSTED' || err.code === 'GMGN_BACKOFF') return [];
+    console.log(`[gmgn] candles ${err.message}`);
+    cache.set(key, { at: now(), value: [] });
+    return [];
+  }
+}
+
+/**
+ * Ringkasan tren dari candles — murah, tidak pakai weight tambahan
+ * setelah fetchGmgnCandles. Return { trend, changePct, lastClose }
+ */
+export function summarizeCandles(candles) {
+  if (!Array.isArray(candles) || candles.length < 2) {
+    return { trend: 'unknown', changePct: null, lastClose: null, sample: 0 };
+  }
+  const first = candles[0].close || 0;
+  const last = candles[candles.length - 1].close || 0;
+  const changePct = first > 0 ? ((last / first - 1) * 100) : null;
+  let trend = 'flat';
+  if (changePct != null) {
+    if (changePct > 8) trend = 'up';
+    else if (changePct < -8) trend = 'down';
+    else if (changePct > 2) trend = 'mild_up';
+    else if (changePct < -2) trend = 'mild_down';
+  }
+  return { trend, changePct: changePct != null ? Math.round(changePct * 10) / 10 : null, lastClose: last, sample: candles.length };
 }
 
 export function resetGmgnWeight() {
