@@ -18,6 +18,7 @@ const BASE = 'https://api.dexscreener.com';
 // Rate-limit state — 429 DexScreener
 let rateBackoffUntil = 0;
 let consecutive429 = 0;
+let last429LogAt = 0;
 let cycleCount = 0;
 
 // In-memory latest snapshot per mint
@@ -32,20 +33,41 @@ export function setCandidateHandler(fn) {
   candidateHandler = fn;
 }
 
+export function rateLimitStatus() {
+  return {
+    backingOff: now() < rateBackoffUntil,
+    until: rateBackoffUntil,
+    consecutive: consecutive429,
+  };
+}
+
 function isRateLimited(err) {
   const msg = String(err?.message || '');
   const status = err?.response?.status;
   return status === 429 || /429|rate limit/i.test(msg);
 }
 
-function noteRateLimit(err) {
-  consecutive429++;
+function noteRateLimit() {
+  consecutive429 = Math.min(consecutive429 + 1, 99);
   const backoffMs = Math.min(180_000, 30_000 * Math.min(consecutive429, 6));
   rateBackoffUntil = now() + backoffMs;
-  console.log(`[dex] RATE LIMITED — backoff ${Math.round(backoffMs / 1000)}s (hit #${consecutive429})`);
+  // Log maksimal 1x / 60 detik — cegah spam hit #600+
+  const t = now();
+  if (t - last429LogAt > 60_000) {
+    last429LogAt = t;
+    console.log(
+      `[dex] RATE LIMITED — backoff ${Math.round(backoffMs / 1000)}s (total ${consecutive429})`
+    );
+  }
 }
 
 async function dexGet(path) {
+  // Selama backoff, JANGAN panggil API sama sekali
+  if (now() < rateBackoffUntil) {
+    const err = new Error('rate limit backoff active');
+    err.code = 'DEX_BACKOFF';
+    throw err;
+  }
   try {
     const res = await axios.get(`${BASE}${path}`, {
       timeout: 12_000,
@@ -54,7 +76,7 @@ async function dexGet(path) {
     consecutive429 = 0;
     return res.data;
   } catch (err) {
-    if (isRateLimited(err)) noteRateLimit(err);
+    if (isRateLimited(err)) noteRateLimit();
     throw err;
   }
 }
@@ -192,6 +214,7 @@ async function pollTopVolume() {
  * Refresh a single token's pair data (used by enrichment / position monitor).
  */
 export async function fetchDexPair(mint) {
+  if (now() < rateBackoffUntil) return null; // hemat kuota saat backoff
   try {
     const data = await dexGet(`/latest/dex/tokens/${mint}`);
     const pairs = (data.pairs || []).filter((p) => p.chainId === 'robinhood');
