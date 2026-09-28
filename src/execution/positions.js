@@ -129,6 +129,8 @@ export async function refreshPosition(position, { autoExit = true } = {}) {
     highWaterPrice,
     highWaterMcap,
     trailingArmed,
+    pnlPercent,
+    pnlEth,
   });
 
   let finalPnlPercent = pnlPercent;
