@@ -1,4 +1,4 @@
-import { createPublicClient, http, parseAbiItem } from 'viem';
+import { parseAbiItem } from 'viem';
 import {
   CHAIN,
   RPC_URL,
@@ -9,20 +9,12 @@ import {
 import { now, pruneSeen, normalizeAddress, toNumber } from '../utils.js';
 import { storeSignalEvent } from '../db/candidates.js';
 import { ingestPairSignal, trending } from './dexscreener.js';
+import { publicClient as client, createWsClient, rpcEndpoints } from '../lib/rpc.js';
 
 /**
  * On-chain Uniswap event watcher for Robinhood Chain.
- * Acts as the second overlap source:
- *   - PairCreated (new pools / "graduated" equivalent)
- *   - Swap volume bursts (fee activity / economic activity)
- *
- * These combine with DexScreener signals for Charon-style overlap gating.
+ * Uses multi-RPC failover client from lib/rpc.js.
  */
-
-const client = createPublicClient({
-  chain: CHAIN,
-  transport: http(RPC_URL),
-});
 
 // Uniswap V2-style PairCreated (V3 factory uses different event but we also watch generic Swap logs)
 const PAIR_CREATED = parseAbiItem('event PairCreated(address indexed token0, address indexed token1, address pair, uint256)');
