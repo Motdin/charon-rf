@@ -2,6 +2,7 @@ import axios from 'axios';
 import {
   DEXSCREENER_POLL_MS,
   DEXSCREENER_ENABLED,
+  DEX_DISCOVERY_ENABLED,
 } from '../config.js';
 import { now, pruneSeen, sleep, toNumber, normalizeAddress } from '../utils.js';
 import { numSetting, activeStrategy } from '../db/settings.js';
@@ -291,6 +292,18 @@ async function maybeTrigger(mint, signalMeta) {
 
 export async function pollDexScreenerOnce() {
   if (!DEXSCREENER_ENABLED) return;
+
+  // Opsi A: discovery OFF — Dex hanya untuk harga posisi via fetchDexPair
+  if (!DEX_DISCOVERY_ENABLED) {
+    cycleCount++;
+    if (cycleCount % 12 === 1) {
+      console.log(
+        `[dex] discovery OFF — harga posisi saja (kandidat dari Pons+on-chain)`
+      );
+    }
+    return;
+  }
+
   if (now() < rateBackoffUntil) {
     const wait = Math.ceil((rateBackoffUntil - now()) / 1000);
     console.log(`[dex] skip poll — rate limit backoff ${wait}s left`);
@@ -298,7 +311,6 @@ export async function pollDexScreenerOnce() {
   }
 
   cycleCount++;
-  // profiles hanya tiap 3 cycle (hemat kuota 429)
   if (cycleCount % 3 === 1) await pollTokenProfiles();
   if (now() >= rateBackoffUntil) await pollSearchTrending();
   if (now() >= rateBackoffUntil) await pollTopVolume();
@@ -311,20 +323,25 @@ export async function pollDexScreenerOnce() {
 
 export function startDexScreenerPolling() {
   if (!DEXSCREENER_ENABLED) {
-    console.log('[dex] disabled');
+    console.log('[dex] disabled (DEXSCREENER_ENABLED=false)');
     return;
   }
+  if (!DEX_DISCOVERY_ENABLED) {
+    console.log('[dex] discovery OFF — hanya fetchDexPair untuk harga posisi');
+    console.log(`[dex] (jika diaktifkan nanti: poll per ${DEXSCREENER_POLL_MS}ms)`);
+    return;
+  }
+  console.log(`[dex] discovery ON — poll per ${DEXSCREENER_POLL_MS}ms`);
   const loop = async () => {
     try {
       await pollDexScreenerOnce();
     } catch (err) {
-      if (isRateLimited(err)) {
-        // sudah backoff
+      if (isRateLimited(err) || err.code === 'DEX_BACKOFF') {
+        // ditangani backoff
       } else {
         console.log(`[dex] poll failed: ${err.message}`);
       }
     }
-    // kalau kena 429, perpanjang jeda
     const delay = now() < rateBackoffUntil ? rateBackoffUntil - now() : DEXSCREENER_POLL_MS;
     setTimeout(loop, delay);
   };
