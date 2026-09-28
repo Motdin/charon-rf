@@ -15,6 +15,8 @@ export const RPC_FALLBACK_URLS = (process.env.RPC_FALLBACK_URLS || '')
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean);
+// WebSocket newHeads watcher (bisa dimatikan jika WS tidak stabil di region Anda)
+export const WS_WATCHER_ENABLED = process.env.WS_WATCHER_ENABLED !== 'false';
 
 // Token addresses on Robinhood Chain
 export const WETH_ADDRESS = process.env.WETH_ADDRESS || '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73';
