@@ -11,6 +11,7 @@ import { activeStrategy, allStrategies, strategyById, setActiveStrategy, updateS
 import { candidateSummary, positionSummary } from './format.js';
 import { escapeHtml, fmtEth, fmtPct, fmtUsd, short, now } from '../utils.js';
 import { executeConfirmedIntent, rejectIntent } from '../execution/router.js';
+import { closePositionManually } from '../execution/positions.js';
 import { gmgnWeightStatus } from '../enrichment/gmgn.js';
 import { addSavedWallet, removeSavedWallet, listSavedWallets } from '../enrichment/wallets.js';
 import { checkTokenSecurity, summarizeSecurity } from '../enrichment/security.js';
@@ -140,6 +141,7 @@ function helpText() {
     '/strategy &lt;id&gt; — activate strategy',
     '/stratset &lt;id&gt; &lt;key&gt; &lt;value&gt; — hot-edit strategy param',
     '/positions — open + recent closed',
+    '/close <id|symbol|CA> — manual close position',
     '/pnl — simple PnL summary',
     '/pnlcard [YYYY-MM-DD] — shareable daily PnL card (PNG for X)',
     '/pnlcard text [YYYY-MM-DD] — text card ready to copy to X',
@@ -508,6 +510,34 @@ export function startTelegramBot() {
                 `Net: ${fmtEth(total)}`,
               ].join('\n')
             );
+            break;
+          }
+
+          case '/close': {
+            const sel = args.join(' ').trim();
+            if (!sel) {
+              const open = openPositions();
+              const list =
+                open
+                  .map((p) => `#${p.id} ${escapeHtml(p.symbol || p.mint.slice(0, 10))} · ${fmtPct(p.pnl_percent || 0)}`)
+                  .join('\n') || '(none)';
+              await sendTelegram(
+                `Usage: <code>/close &lt;id|symbol|CA&gt;</code>\n\n<b>Open:</b>\n${list}`,
+                { parse_mode: 'HTML' }
+              );
+              break;
+            }
+            await sendTelegram(`⏳ Menutup <code>${escapeHtml(sel)}</code>…`);
+            try {
+              const res = await closePositionManually(sel, { reason: 'MANUAL' });
+              if (!res.ok) {
+                await sendTelegram(`❌ ${escapeHtml(res.error)}`);
+                break;
+              }
+              await sendTelegram(`✅ <b>Posisi #${res.position.id} ditutup manual</b>\n\n${positionSummary(res.position)}`);
+            } catch (err) {
+              await sendTelegram(`❌ close gagal: ${escapeHtml(err.message)}`, { parse_mode: 'HTML' });
+            }
             break;
           }
 
