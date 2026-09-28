@@ -45,7 +45,9 @@ export const LLM_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS || 60_000);
 export const ENABLE_LLM = process.env.ENABLE_LLM !== 'false';
 
 export const DEXSCREENER_ENABLED = process.env.DEXSCREENER_ENABLED !== 'false';
-export const DEXSCREENER_POLL_MS = Number(process.env.DEXSCREENER_POLL_MS || 30_000);
+// Discovery = search/profiles/trending (boros kuota). OFF = Dex hanya untuk harga posisi.
+export const DEX_DISCOVERY_ENABLED = process.env.DEX_DISCOVERY_ENABLED === 'true';
+export const DEXSCREENER_POLL_MS = Number(process.env.DEXSCREENER_POLL_MS || 60_000);
 export const ONCHAIN_EVENTS_ENABLED = process.env.ONCHAIN_EVENTS_ENABLED !== 'false';
 export const ONCHAIN_POLL_MS = Number(process.env.ONCHAIN_POLL_MS || 30_000);
 export const POSITION_CHECK_MS = Number(process.env.POSITION_CHECK_MS || 10_000);
