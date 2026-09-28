@@ -15,6 +15,11 @@ import { storeSignalEvent } from '../db/candidates.js';
 
 const BASE = 'https://api.dexscreener.com';
 
+// Rate-limit state — 429 DexScreener
+let rateBackoffUntil = 0;
+let consecutive429 = 0;
+let cycleCount = 0;
+
 // In-memory latest snapshot per mint
 export const trending = new Map(); // mint -> latest pair data
 export const volumeSpikes = new Map(); // mint -> spike metadata
@@ -27,12 +32,31 @@ export function setCandidateHandler(fn) {
   candidateHandler = fn;
 }
 
+function isRateLimited(err) {
+  const msg = String(err?.message || '');
+  const status = err?.response?.status;
+  return status === 429 || /429|rate limit/i.test(msg);
+}
+
+function noteRateLimit(err) {
+  consecutive429++;
+  const backoffMs = Math.min(180_000, 30_000 * Math.min(consecutive429, 6));
+  rateBackoffUntil = now() + backoffMs;
+  console.log(`[dex] RATE LIMITED — backoff ${Math.round(backoffMs / 1000)}s (hit #${consecutive429})`);
+}
+
 async function dexGet(path) {
-  const res = await axios.get(`${BASE}${path}`, {
-    timeout: 12_000,
-    headers: { Accept: 'application/json' },
-  });
-  return res.data;
+  try {
+    const res = await axios.get(`${BASE}${path}`, {
+      timeout: 12_000,
+      headers: { Accept: 'application/json' },
+    });
+    consecutive429 = 0;
+    return res.data;
+  } catch (err) {
+    if (isRateLimited(err)) noteRateLimit(err);
+    throw err;
+  }
 }
 
 function pairToSignal(pair, source) {
@@ -121,14 +145,13 @@ async function pollTokenProfiles() {
       await maybeTrigger(mint, { hasNewPool: true, route: 'new_pool' });
     }
   } catch (err) {
+    if (isRateLimited(err)) return; // sudah dicatat di dexGet
     console.log(`[dex] profiles: ${err.message}`);
   }
 }
 
 async function pollSearchTrending() {
   try {
-    // Search robinhood-chain active pairs via search endpoint using a broad query
-    // DexScreener search is keyword-based; we also use token-pairs endpoint once we know mints.
     const data = await dexGet('/latest/dex/search?q=robinhood');
     const pairs = (data.pairs || []).filter((p) => p.chainId === 'robinhood');
     for (const pair of pairs.slice(0, 30)) {
@@ -137,13 +160,18 @@ async function pollSearchTrending() {
       ingestPairSignal(signal);
     }
   } catch (err) {
+    if (isRateLimited(err)) return;
     console.log(`[dex] search: ${err.message}`);
   }
 }
 
 async function pollTopVolume() {
-  // Use search with chain-focused terms to approximate "trending"
-  for (const q of ['pepe', 'dog', 'moon', 'inu', 'hood', 'wif']) {
+  // Kurangi keyword: 2x per cycle saja (rotasi), bukan 6 sekaligus
+  const all = ['pepe', 'hood', 'moon', 'dog'];
+  const start = (cycleCount * 2) % all.length;
+  const batch = [all[start], all[(start + 1) % all.length]];
+  for (const q of batch) {
+    if (now() < rateBackoffUntil) return;
     try {
       const data = await dexGet(`/latest/dex/search?q=${encodeURIComponent(q)}`);
       const pairs = (data.pairs || []).filter((p) => p.chainId === 'robinhood');
@@ -153,9 +181,10 @@ async function pollTopVolume() {
         ingestPairSignal(signal);
       }
     } catch (err) {
+      if (isRateLimited(err)) return;
       console.log(`[dex] trending(${q}): ${err.message}`);
     }
-    await sleep(800); // be polite to public API
+    await sleep(2000); // lebih sopan ke public API
   }
 }
 
@@ -239,11 +268,21 @@ async function maybeTrigger(mint, signalMeta) {
 
 export async function pollDexScreenerOnce() {
   if (!DEXSCREENER_ENABLED) return;
-  await pollTokenProfiles();
-  await pollSearchTrending();
-  await pollTopVolume();
+  if (now() < rateBackoffUntil) {
+    const wait = Math.ceil((rateBackoffUntil - now()) / 1000);
+    console.log(`[dex] skip poll — rate limit backoff ${wait}s left`);
+    return;
+  }
+
+  cycleCount++;
+  // profiles hanya tiap 3 cycle (hemat kuota 429)
+  if (cycleCount % 3 === 1) await pollTokenProfiles();
+  if (now() >= rateBackoffUntil) await pollSearchTrending();
+  if (now() >= rateBackoffUntil) await pollTopVolume();
+
   console.log(
-    `[dex] snapshot trending=${trending.size} spikes=${volumeSpikes.size} newPools=${newPools.size}`
+    `[dex] snapshot trending=${trending.size} spikes=${volumeSpikes.size} newPools=${newPools.size}` +
+      (now() < rateBackoffUntil ? ' · rate-limited' : '')
   );
 }
 
@@ -256,9 +295,15 @@ export function startDexScreenerPolling() {
     try {
       await pollDexScreenerOnce();
     } catch (err) {
-      console.log(`[dex] poll failed: ${err.message}`);
+      if (isRateLimited(err)) {
+        // sudah backoff
+      } else {
+        console.log(`[dex] poll failed: ${err.message}`);
+      }
     }
-    setTimeout(loop, DEXSCREENER_POLL_MS);
+    // kalau kena 429, perpanjang jeda
+    const delay = now() < rateBackoffUntil ? rateBackoffUntil - now() : DEXSCREENER_POLL_MS;
+    setTimeout(loop, delay);
   };
   loop();
 }
