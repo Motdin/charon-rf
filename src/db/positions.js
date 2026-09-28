@@ -146,11 +146,21 @@ export function closePosition({ id, exitPrice, exitMcap, exitReason, pnlPercent,
   ).run(now(), exitPrice, exitMcap, exitReason, pnlPercent, pnlEth, exitSignature ?? null, id);
 }
 
-export function updateHighWater({ id, highWaterPrice, highWaterMcap, trailingArmed }) {
-  db.prepare('UPDATE dry_run_positions SET high_water_price = ?, high_water_mcap = ?, trailing_armed = ? WHERE id = ?').run(
+export function updateHighWater({ id, highWaterPrice, highWaterMcap, trailingArmed, pnlPercent, pnlEth }) {
+  // pnl_percent / pnl_eth diisi juga untuk posisi OPEN (unrealized)
+  // supaya /positions menampilkan PnL live, bukan 0 terus
+  db.prepare(
+    `UPDATE dry_run_positions
+     SET high_water_price = ?, high_water_mcap = ?, trailing_armed = ?,
+         pnl_percent = COALESCE(?, pnl_percent),
+         pnl_eth = COALESCE(?, pnl_eth)
+     WHERE id = ?`
+  ).run(
     highWaterPrice,
     highWaterMcap,
     trailingArmed ? 1 : 0,
+    Number.isFinite(Number(pnlPercent)) ? Number(pnlPercent) : null,
+    Number.isFinite(Number(pnlEth)) ? Number(pnlEth) : null,
     id
   );
 }
