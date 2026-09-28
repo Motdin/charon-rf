@@ -16,6 +16,7 @@ import { fetchDexPair, trending } from '../signals/dexscreener.js';
 import { executeLiveSell } from './router.js';
 import { sendPositionExit, sendTelegram } from '../telegram/send.js';
 import { now, toNumber, firstPositiveNumber, fmtPct } from '../utils.js';
+import { startBlockWatcher } from '../lib/blockWatcher.js';
 
 /**
  * Position manager — Charon-style TP / SL / trailing / partial TP / max hold.
@@ -290,13 +291,103 @@ export async function monitorPositions() {
 
 export function startPositionMonitor(intervalMs) {
   const period = intervalMs || numSetting('position_check_ms', 10_000) || 10_000;
-  const loop = async () => {
+  let busy = false;
+  const tick = async (reason = 'poll') => {
+    if (busy) return;
+    busy = true;
     try {
       await monitorPositions();
     } catch (err) {
-      console.log(`[position] monitor error: ${err.message}`);
+      console.log(`[position] monitor error (${reason}): ${err.message}`);
+    } finally {
+      busy = false;
     }
+  };
+
+  // Poll tetap jalan sebagai baseline
+  const loop = async () => {
+    await tick('poll');
     setTimeout(loop, period);
   };
   loop();
+
+  // WebSocket newHeads → monitor lebih responsif
+  startBlockWatcher(async (blockNumber) => {
+    await tick(`ws:${blockNumber}`);
+  }).then((res) => {
+    if (res.ok) console.log('[position] ws block watcher active — poll fallback tetap jalan');
+  });
+}
+
+/**
+ * Close manual posisi (dry_run / live).
+ * /close <id> — atau /close <symbol/CA> untuk yang open.
+ */
+export async function closePositionManually(selector, { reason = 'MANUAL' } = {}) {
+  const key = String(selector || '').toLowerCase();
+  const open = openPositions();
+  const position =
+    open.find((p) => String(p.id) === String(selector)) ||
+    open.find((p) => (p.mint || '').toLowerCase() === key) ||
+    open.find((p) => (p.symbol || '').toLowerCase() === key) ||
+    open.find((p) => (p.mint || '').toLowerCase().includes(key) && key.length > 3);
+
+  if (!position) {
+    return { ok: false, error: `Posisi open tidak ditemukan: ${selector}` };
+  }
+
+  const dex = await fetchDexPair(position.mint);
+  const price = Number(dex?.priceUsd || position.entry_price || 0);
+  const mcap = Number(dex?.market_cap || position.entry_mcap || 0);
+  const entryPrice = Number(position.entry_price) || 1;
+  const pnlPercent = price > 0 && entryPrice > 0 ? (price / entryPrice - 1) * 100 : Number(position.pnl_percent || 0);
+  const pnlEth = (Number(position.size_eth) * pnlPercent) / 100;
+
+  let exitSignature = null;
+  let receivedEth = null;
+
+  if (position.execution_mode === 'live') {
+    const sell = await executeLiveSell(position, reason);
+    exitSignature = sell.signature;
+    const wei = Number(sell.outputAmount || 0);
+    if (wei > 0) receivedEth = wei / 1e18;
+  }
+
+  const finalPnlEth = receivedEth != null ? receivedEth - Number(position.size_eth) : pnlEth;
+  const finalPnlPct =
+    receivedEth != null ? (receivedEth / Number(position.size_eth) - 1) * 100 : pnlPercent;
+
+  closePosition({
+    id: position.id,
+    exitPrice: price,
+    exitMcap: mcap,
+    exitReason: reason,
+    pnlPercent: finalPnlPct,
+    pnlEth: finalPnlEth,
+    exitSignature,
+  });
+
+  recordTrade({
+    positionId: position.id,
+    mint: position.mint,
+    side: 'sell',
+    price,
+    mcap,
+    sizeEth: position.size_eth,
+    tokenAmountEst: position.token_amount_est,
+    reason,
+    payload: { manual: true, pnlPercent: finalPnlPct, pnlEth: finalPnlEth, receivedEth, exitSignature },
+  });
+
+  return {
+    ok: true,
+    position: {
+      ...position,
+      status: 'closed',
+      pnl_percent: finalPnlPct,
+      pnl_eth: finalPnlEth,
+      exit_price: price,
+      exit_reason: reason,
+    },
+  };
 }
