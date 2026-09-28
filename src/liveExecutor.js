@@ -1,5 +1,4 @@
 import {
-  createPublicClient,
   createWalletClient,
   http,
   parseAbi,
@@ -20,6 +19,7 @@ import {
   CHAIN_ID,
 } from './config.js';
 import { normalizeAddress, toNumber } from './utils.js';
+import { publicClient, rpcEndpoints } from './lib/rpc.js';
 
 /**
  * Live executor for Robinhood Chain via Uniswap V3 SwapRouter02.
@@ -50,11 +50,7 @@ const ROUTER_ABI = parseAbi([
 // Common Uniswap V3 fee tiers
 const FEE_TIERS = [500, 3000, 10000, 100];
 
-const publicClient = createPublicClient({
-  chain: CHAIN,
-  transport: http(RPC_URL),
-});
-
+// publicClient dari lib/rpc.js — multi-endpoint failover
 let walletClient = null;
 let account = null;
 

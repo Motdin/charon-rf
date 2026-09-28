@@ -8,7 +8,13 @@ export const DB_PATH = process.env.DB_PATH || './charon-rh.sqlite';
 // Robinhood Chain — EVM L2 (Arbitrum Orbit), chainId 4663
 export const CHAIN_ID = Number(process.env.CHAIN_ID || 4663);
 export const RPC_URL = process.env.RPC_URL || 'https://rpc.mainnet.chain.robinhood.com';
-export const WS_URL = process.env.WS_URL || 'wss://robinhood-rpc.publicnode.com';
+export const WS_URL = process.env.WS_URL || 'wss://robinhood.drpc.org';
+// Failover HTTP: pisah dengan koma. Contoh:
+// RPC_FALLBACK_URLS=https://robinhood.drpc.org,https://robinhood-rpc.publicnode.com
+export const RPC_FALLBACK_URLS = (process.env.RPC_FALLBACK_URLS || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 // Token addresses on Robinhood Chain
 export const WETH_ADDRESS = process.env.WETH_ADDRESS || '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73';

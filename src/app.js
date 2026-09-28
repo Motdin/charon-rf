@@ -10,6 +10,7 @@ import { processCandidateFromSignals } from './pipeline/orchestrator.js';
 import { startPositionMonitor } from './execution/positions.js';
 import { startTelegramBot } from './telegram/send.js';
 import { gmgnWeightStatus } from './enrichment/gmgn.js';
+import { rpcEndpoints } from './lib/rpc.js';
 
 /**
  * Charon-RH bootstrap.
@@ -30,6 +31,7 @@ export async function startCharon() {
 
   const strat = activeStrategy();
   console.log(`[${APP_NAME}] starting on chain ${CHAIN_ID} via ${RPC_URL}`);
+  console.log(`[${APP_NAME}] RPC failover chain: ${rpcEndpoints().join(' → ')}`);
   console.log(`[${APP_NAME}] trading mode: ${tradingMode()}`);
   console.log(`[${APP_NAME}] strategy: ${strat.id} (${strat.name})`);
   console.log(
