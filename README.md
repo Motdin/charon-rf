@@ -83,6 +83,13 @@ LIVE_MIN_ETH_RESERVE=0.005
 SLIPPAGE_BPS=300
 ```
 
+> ⚠️ **Kontrak Uniswap — jangan pakai alamat canonical mainnet.** Alamat
+> SwapRouter02 `0x68b3…45fc` (default lama) dan factory `0x3312…fdfd` adalah alamat
+> *Ethereum mainnet* — di Robinhood Chain alamat itu **bukan kontrak** (EOA mati).
+> Default repo sekarang sudah alamat RH Chain yang terverifikasi, dan bot menolak
+> start di mode `live`/`confirm` jika ada kontrak router tanpa bytecode
+> (preflight saat boot). Detail & routing: lihat [Live execution routing](#live-execution-routing-v4v3).
+
 ---
 
 ## Telegram commands
@@ -495,6 +502,34 @@ GET https://www.ponsfamily.com/api/pons-market/{token}
 Factory (v1): `0xA5aAb3F0c6EeadF30Ef1D3Eb997108E976351feB`
 Factory (v2): `0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e`
 
+## Live execution routing (V4/V3)
+
+Eksekutor live memilih venue secara otomatis per token (`src/liveExecutor.js` → `resolveSwapRoute`):
+
+| Venue | Kapan dipakai | Kontrak RH Chain (terverifikasi) |
+|---|---|---|
+| **Uniswap V4** (utama) | Pool meme ber-quote **ETH native** — mayoritas meme RH (labels `v4` di DexScreener, `pairAddress` = poolId 32-byte) | UniversalRouter `0x8876789976dEcBfCbBbe364623C63652db8C0904` · PoolManager `0x8366a39CC670B4001A1121B8F6A443A643e40951` · Quoter `0x8Dc178eFB8111BB0973Dd9d722ebeFF267c98F94` · StateView `0xF3334192D15450CdD385c8B70e03f9a6bD9E673b` |
+| **Uniswap V3** | Pool WETH–token ada di factory V3 | SwapRouter02 `0xCaf681a66D020601342297493863E78C959E5cb2` · Factory `0x1f7d7550B1b028f7571E69A784071F0205FD2EfA` |
+
+Cara kerja:
+
+1. **Route resolve**: DexScreener pair (`labels`) → cache SQLite `v4_pools` → scan factory V3 → scan log `Initialize` PoolManager V4 (fee/tickSpacing/hooks selalu dibaca dari log, tidak pernah ditebak).
+2. **V4**: buy dengan pool ETH-native tidak perlu wrap sama sekali (settle via `msg.value`); quote dari V4Quoter off-chain → `simulateContract` penuh → baru kirim tx. Sell ERC20 memakai jalur **Permit2** (`0x0000…BA3`). Encoding V4_SWAP diverifikasi **byte-identik** dengan tx sukses on-chain (golden test `scripts/smoke-executor.js`).
+3. **V3**: quote lewat simulasi, wrap **hanya selisih kekurangan** WETH, `amountOutMinimum` dari quote dengan `SLIPPAGE_BPS`.
+4. **Pengaman dana**:
+   - Preflight boot (`live`/`confirm`): semua kontrak router harus punya bytecode — kalau tidak, bot **berhenti** dengan pesan jelas.
+   - **Quote & simulasi mendahului** setiap transaksi bernilai.
+   - Reserve check menghitung ETH native **+ WETH**; reserve gas tetap native.
+   - Gagal total setelah wrap → **auto-unwrap rollback** (`LIVE_UNWRAP_ON_FAIL=true`).
+   - Pool/currency tak didukung (quote bukan ETH/WETH) → ditolak sebelum dana bergerak.
+
+Utilitas:
+
+```bash
+node scripts/probe-route.js <mint> [amountEth]   # read-only: venue + poolKey + quote V4
+node scripts/revoke-weth.js [spender...]         # bersihkan approve WETH ke alamat mati
+```
+
 ## Risk controls
 
 - Fixed position size per strategy (`position_size_eth`)
@@ -530,15 +565,16 @@ charon-rh/
   src/
     config.js
     app.js
-    db/            sqlite schema + strategy seeds
+    db/            sqlite schema + strategy seeds + v4_pools cache
     signals/       dexscreener, uniswapEvents, priceMonitor, pons
     enrichment/    gmgn, blockscout, security, wallets, aggregate
     pipeline/      candidateBuilder, llm, orchestrator
     learning/      lessons.js — LLM trade review → /learn
-    execution/     router (buy/sell), positions (TP/SL, price-based PnL)
+    execution/     router (buy/sell), positions (TP/SL, price-based PnL),
+                   v4 (Universal Router/Quoter/poolKey), swapMath (pure helpers)
     telegram/      bot + menu + format
-    liveExecutor.js  viem + Uniswap V3 SwapRouter02
-  scripts/         smoke suites, verify, render_pnl_card.py
+    liveExecutor.js  viem + routing V4 (native ETH) / V3 (WETH) + fund-safety rails
+  scripts/         smoke suites, verify, probe-route, revoke-weth, render_pnl_card.py
 ```
 
 ## Verify
@@ -555,7 +591,7 @@ npm test         # alias verify
 - Robinhood Chain public RPCs: `rpc.mainnet.chain.robinhood.com`, `robinhood-rpc.publicnode.com`, `robinhood.drpc.org`
 - Explorers: [robinscan.io](https://robinscan.io), [blockscout](https://robinhoodchain.blockscout.com)
 - DexScreener public API is rate-limited — polling intervals are intentionally conservative
-- Uniswap V3 SwapRouter02 is used for swaps; V4 pools exist on-chain and are tracked as events
+- Live swaps route otomatis ke Uniswap **V4** (pool meme ber-quote ETH native — jalur utama di chain ini) atau **V3** (pool WETH) — lihat [Live execution routing](#live-execution-routing-v4v3)
 - Tokenized stocks on Robinhood Chain settle via USDG and are **out of scope** of this meme-trench agent
 
 ---

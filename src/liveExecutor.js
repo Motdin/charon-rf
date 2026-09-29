@@ -2,28 +2,65 @@ import {
   createWalletClient,
   http,
   parseAbi,
-  parseUnits,
   formatEther,
   parseEther,
-  encodeFunctionData,
+  maxUint160,
+  maxUint256,
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
+import axios from 'axios';
 import {
   CHAIN,
   RPC_URL,
   PRIVATE_KEY,
   WETH_ADDRESS,
   UNISWAP_ROUTER,
+  UNISWAP_V3_FACTORY,
+  UNISWAP_UNIVERSAL_ROUTER,
+  UNISWAP_V4_POOL_MANAGER,
+  UNISWAP_V4_QUOTER,
+  UNISWAP_V4_STATE_VIEW,
+  PERMIT2_ADDRESS,
+  LIVE_V4_ENABLED,
+  LIVE_UNWRAP_ON_FAIL,
+  SWAP_DEADLINE_SECONDS,
   SLIPPAGE_BPS,
   LIVE_MIN_ETH_RESERVE,
   CHAIN_ID,
+  NATIVE_ETH,
 } from './config.js';
-import { normalizeAddress, toNumber } from './utils.js';
-import { publicClient, rpcEndpoints } from './lib/rpc.js';
+import { normalizeAddress } from './utils.js';
+import { publicClient } from './lib/rpc.js';
+import {
+  buildV4SwapInput,
+  findV4Pools,
+  pickMostLiquidPool,
+  poolIdFromKey,
+  quoteV4ExactInputSingle,
+  UNIVERSAL_ROUTER_ABI,
+} from './execution/v4.js';
+import {
+  isNativeSentinel,
+  looksLikeV4PoolId,
+  routeKindFromDexPair,
+  minOutWithSlippage,
+  wrapDeficit,
+  reserveVerdict,
+} from './execution/swapMath.js';
+import { cacheV4Pool, cachedV4PoolsForMint } from './db/v4pools.js';
 
 /**
- * Live executor for Robinhood Chain via Uniswap V3 SwapRouter02.
- * Uses exactInputSingle (token <-> WETH). Native ETH is wrapped first if needed.
+ * Live executor Robinhood Chain.
+ *
+ * Prinsip keamanan dana (hasil insiden ETH-terkunci-di-WETH):
+ *   1. QUOTE & SIMULATE sebelum side effect on-chain bila memungkinkan.
+ *   2. Wrap HANYA selisih kekurangan WETH; native reserve untuk gas tak disentuh.
+ *   3. Gagal total → WETH yang baru di-wrap otomatis di-unwrap kembali.
+ *   4. Router diverifikasi punya bytecode sebelum satu wei pun bergerak.
+ *
+ * Jalur swap:
+ *   - Uniswap V4 (Universal Router 0x8876…0904, pool ber-quote ETH native) — utama untuk meme RH
+ *   - Uniswap V3 (SwapRouter02 0xCaf6…5cb2, pool ber-quote WETH)
  */
 
 const ERC20_ABI = parseAbi([
@@ -36,23 +73,38 @@ const ERC20_ABI = parseAbi([
 
 const WETH_ABI = parseAbi([
   'function deposit() payable',
-  'function withdraw(uint256)',
+  'function withdraw(uint256) returns ()',
   'function balanceOf(address) view returns (uint256)',
   'function approve(address spender, uint256 amount) returns (bool)',
 ]);
 
-// SwapRouter02 exactInputSingle
-const ROUTER_ABI = parseAbi([
+// SwapRouter02 exactInputSingle (V3)
+const V3_ROUTER_ABI = parseAbi([
   'struct ExactInputSingleParams { address tokenIn; address tokenOut; uint24 fee; address recipient; uint256 amountIn; uint256 amountOutMinimum; uint160 sqrtPriceLimitX96; }',
   'function exactInputSingle(ExactInputSingleParams calldata params) payable returns (uint256 amountOut)',
 ]);
 
-// Common Uniswap V3 fee tiers
-const FEE_TIERS = [500, 3000, 10000, 100];
+const V3_FACTORY_ABI = parseAbi([
+  'function getPool(address tokenA, address tokenB, uint24 fee) view returns (address pool)',
+]);
 
-// publicClient dari lib/rpc.js — multi-endpoint failover
+const V3_POOL_ABI = parseAbi([
+  'function fee() view returns (uint24)',
+  'function liquidity() view returns (uint128)',
+]);
+
+const PERMIT2_ABI = parseAbi([
+  'function approve(address token, address spender, uint160 amount, uint48 expiration) returns ()',
+  'function allowance(address user, address token, address spender) view returns (uint160 amount, uint48 expiration, uint48 nonce)',
+]);
+
+const FEE_TIERS = [100, 500, 3000, 10000];
+const ZERO = '0x0000000000000000000000000000000000000000';
+const PERMIT2_EXPIRY_S = 30 * 24 * 3600; // 30 hari
+
 let walletClient = null;
 let account = null;
+let preflightCache = null;
 
 function ensureWallet() {
   if (walletClient) return { walletClient, account };
@@ -77,9 +129,29 @@ export function liveWalletPubkey() {
   }
 }
 
+// ─── Saldo & reserve ──────────────────────────────────────────────────────────
+
 export async function liveWalletBalanceLamports() {
   const { account } = ensureWallet();
   return publicClient.getBalance({ address: account.address });
+}
+
+async function wethBalance(address) {
+  return publicClient.readContract({
+    address: normalizeAddress(WETH_ADDRESS),
+    abi: WETH_ABI,
+    functionName: 'balanceOf',
+    args: [address],
+  });
+}
+
+export async function walletBalances() {
+  const { account } = ensureWallet();
+  const [nativeWei, wethWei] = await Promise.all([
+    publicClient.getBalance({ address: account.address }),
+    wethBalance(account.address),
+  ]);
+  return { nativeWei, wethWei, totalWei: nativeWei + wethWei };
 }
 
 export async function fetchLiveTokenBalance(mint) {
@@ -92,14 +164,151 @@ export async function fetchLiveTokenBalance(mint) {
   });
 }
 
+/**
+ * Reserve check WETH-aware: dana posisi boleh berasal dari WETH,
+ * tapi reserve (gas) harus selalu tersedia sebagai native ETH.
+ */
+export async function checkLiveReserve(needEth) {
+  const { nativeWei, wethWei, totalWei } = await walletBalances();
+  const need = parseEther(String(needEth));
+  const reserve = parseEther(String(LIVE_MIN_ETH_RESERVE));
+  const verdict = reserveVerdict({ nativeWei, wethWei, needWei: need, reserveWei: reserve });
+  return {
+    balance: verdict.nativeWei, // kompatibel lama (native only)
+    wethBalance: verdict.wethWei,
+    totalBalance: totalWei,
+    sufficient: verdict.sufficient,
+    need,
+    reserve,
+  };
+}
+
+// ─── Preflight: kontrak harus BENAR-BENAR ADA di chain ini ────────────────────
+
+async function hasCode(address) {
+  if (!address || !/^0x[0-9a-fA-F]{40}$/.test(address)) return false;
+  try {
+    const code = await publicClient.getBytecode({ address });
+    return Boolean(code && code !== '0x');
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Verifikasi semua kontrak eksekusi punya bytecode di Robinhood Chain.
+ * Alamat canonical mainnet (mis. SwapRouter02 0x68b3…45fc) = EOA mati di sini.
+ * Return { checks, ok, missing }.
+ */
+export async function preflightLiveExecutor({ force = false } = {}) {
+  if (preflightCache && !force) return preflightCache;
+  const targets = [
+    ['WETH', WETH_ADDRESS],
+    ['UNISWAP_ROUTER (V3 SwapRouter02)', UNISWAP_ROUTER],
+    ['UNISWAP_V3_FACTORY', UNISWAP_V3_FACTORY],
+  ];
+  if (LIVE_V4_ENABLED) {
+    targets.push(
+      ['UNISWAP_UNIVERSAL_ROUTER (V4)', UNISWAP_UNIVERSAL_ROUTER],
+      ['UNISWAP_V4_POOL_MANAGER', UNISWAP_V4_POOL_MANAGER],
+      ['UNISWAP_V4_QUOTER', UNISWAP_V4_QUOTER],
+      ['PERMIT2_ADDRESS', PERMIT2_ADDRESS]
+    );
+  }
+  const checks = [];
+  for (const [label, address] of targets) {
+    // eslint-disable-next-line no-await-in-loop
+    const ok = await hasCode(address);
+    checks.push({ label, address, ok });
+  }
+  const missing = checks.filter((c) => !c.ok);
+  preflightCache = { checks, ok: missing.length === 0, missing };
+  return preflightCache;
+}
+
+async function assertContract(address, label) {
+  if (!(await hasCode(address))) {
+    throw new Error(
+      `${label} (${address}) is NOT a contract on chain ${CHAIN_ID} — refusing to send funds. ` +
+        `Check your .env (jangan pakai alamat canonical mainnet).`
+    );
+  }
+}
+
+// ─── Wrap / unwrap WETH ───────────────────────────────────────────────────────
+
+async function wrapWeth(amountWei) {
+  const { walletClient } = ensureWallet();
+  const hash = await walletClient.writeContract({
+    address: normalizeAddress(WETH_ADDRESS),
+    abi: WETH_ABI,
+    functionName: 'deposit',
+    value: BigInt(amountWei),
+  });
+  await publicClient.waitForTransactionReceipt({ hash });
+  return hash;
+}
+
+async function unwrapWeth(amountWei) {
+  const { walletClient } = ensureWallet();
+  const hash = await walletClient.writeContract({
+    address: normalizeAddress(WETH_ADDRESS),
+    abi: WETH_ABI,
+    functionName: 'withdraw',
+    args: [BigInt(amountWei)],
+  });
+  await publicClient.waitForTransactionReceipt({ hash });
+  return hash;
+}
+
+/**
+ * Pastikan saldo WETH >= amountWei; wrap HANYA deficitnya.
+ * Reserve native untuk gas tidak boleh disentuh.
+ * Return jumlah yang baru di-wrap (untuk rollback bila perlu).
+ */
+async function ensureWethCoverage(amountWei, reserveWei) {
+  const { account } = ensureWallet();
+  const need = BigInt(amountWei);
+  const [wethBal, nativeBal] = await Promise.all([
+    wethBalance(account.address),
+    publicClient.getBalance({ address: account.address }),
+  ]);
+  const deficit = wrapDeficit(need, wethBal);
+  if (deficit <= 0n) return { wrapped: 0n, wethBalance: wethBal };
+  const spendableNative = nativeBal > reserveWei ? nativeBal - reserveWei : 0n;
+  if (deficit > spendableNative) {
+    throw new Error(
+      `Insufficient native ETH to wrap ${formatEther(deficit)} WETH while keeping ` +
+        `${formatEther(reserveWei)} gas reserve (native: ${formatEther(nativeBal)}, weth: ${formatEther(wethBal)}).`
+    );
+  }
+  await wrapWeth(deficit);
+  return { wrapped: deficit, wethBalance: wethBal + deficit };
+}
+
+/** Rollback: kembalikan WETH yang baru di-wrap ke native ETH. Best-effort. */
+async function rollbackWrap(wrappedWei) {
+  if (!LIVE_UNWRAP_ON_FAIL || BigInt(wrappedWei) <= 0n) return;
+  try {
+    await unwrapWeth(wrappedWei);
+    console.log(`[live] rollback unwrap OK — ${formatEther(wrappedWei)} ETH kembali native`);
+  } catch (err) {
+    console.log(
+      `[live] rollback unwrap FAILED: ${err.message} — ` +
+        `${formatEther(wrappedWei)} WETH tersisa di wallet (aman, bisa withdraw manual)`
+    );
+  }
+}
+
+// ─── Approvals ────────────────────────────────────────────────────────────────
+
 async function ensureAllowance(token, spender, amount) {
   const { walletClient, account } = ensureWallet();
-  const owner = account.address;
   const current = await publicClient.readContract({
     address: token,
     abi: ERC20_ABI,
     functionName: 'allowance',
-    args: [owner, spender],
+    args: [account.address, spender],
   });
   if (BigInt(current) >= BigInt(amount)) return;
   const hash = await walletClient.writeContract({
@@ -112,105 +321,465 @@ async function ensureAllowance(token, spender, amount) {
 }
 
 /**
- * Execute a swap: inputMint -> outputMint for `amount` raw units of input.
- * If input is native ETH sentinel, we use msg.value.
- * Tries common Uniswap V3 fee tiers.
+ * Approval jalur Permit2 (dibutuhkan V4 untuk input ERC20):
+ *   1. token.approve(Permit2, max) — sekali per token
+ *   2. permit2.approve(token, UniversalRouter, max, expiry) — per (token, spender)
  */
-export async function executeJupiterSwap({ inputMint, outputMint, amount }) {
-  // Name kept similar to Charon for familiarity; this is Uniswap, not Jupiter.
+async function ensurePermit2Allowance(token, amount) {
   const { walletClient, account } = ensureWallet();
-  const amountIn = BigInt(amount);
-  const isNativeIn = !inputMint || inputMint === '0x0000000000000000000000000000000000000000';
-  const tokenIn = isNativeIn ? normalizeAddress(WETH_ADDRESS) : normalizeAddress(inputMint);
-  const tokenOut = normalizeAddress(outputMint);
-  const router = normalizeAddress(UNISWAP_ROUTER);
+  const permit2 = normalizeAddress(PERMIT2_ADDRESS);
+  const router = normalizeAddress(UNISWAP_UNIVERSAL_ROUTER);
 
-  // Wrap ETH -> WETH when needed
-  let actualTokenIn = tokenIn;
-  let value = 0n;
-  if (isNativeIn) {
-    value = amountIn;
+  const erc20Allowance = await publicClient.readContract({
+    address: token,
+    abi: ERC20_ABI,
+    functionName: 'allowance',
+    args: [account.address, permit2],
+  });
+  if (BigInt(erc20Allowance) < BigInt(amount)) {
     const hash = await walletClient.writeContract({
-      address: tokenIn,
-      abi: WETH_ABI,
-      functionName: 'deposit',
-      value: amountIn,
+      address: token,
+      abi: ERC20_ABI,
+      functionName: 'approve',
+      args: [permit2, maxUint256],
     });
     await publicClient.waitForTransactionReceipt({ hash });
   }
 
-  await ensureAllowance(actualTokenIn, router, amountIn);
+  const [p2Amount, p2Expiration] = await publicClient.readContract({
+    address: permit2,
+    abi: PERMIT2_ABI,
+    functionName: 'allowance',
+    args: [account.address, token, router],
+  });
+  const nowS = BigInt(Math.floor(Date.now() / 1000));
+  if (BigInt(p2Amount) < BigInt(amount) || BigInt(p2Expiration) < nowS + 3600n) {
+    const hash = await walletClient.writeContract({
+      address: permit2,
+      abi: PERMIT2_ABI,
+      functionName: 'approve',
+      args: [token, router, maxUint160, Number(nowS + BigInt(PERMIT2_EXPIRY_S))],
+    });
+    await publicClient.waitForTransactionReceipt({ hash });
+  }
+}
 
-  // Quote: estimate min-out with a rough slippage floor (we don't have a quoter dependency hard-required)
-  // Try fee tiers; prefer 3000 (0.3%) then 500, 10000.
-  let lastError = null;
-  for (const fee of FEE_TIERS) {
-    try {
-      // Simulate first
-      const { request, result } = await publicClient.simulateContract({
-        address: router,
-        abi: ROUTER_ABI,
-        functionName: 'exactInputSingle',
-        args: [
-          {
-            tokenIn: actualTokenIn,
-            tokenOut,
-            fee,
-            recipient: account.address,
-            amountIn,
-            amountOutMinimum: 0n, // rely on slippage via min-out after simulate
-            sqrtPriceLimitX96: 0n,
-          },
-        ],
-        account: account.address,
-      });
+// ─── Resolusi rute (V4 utama, V3 fallback) ────────────────────────────────────
 
-      const quotedOut = BigInt(result);
-      const minOut = (quotedOut * BigInt(10_000 - SLIPPAGE_BPS)) / 10_000n;
+async function fetchDexPairHint(mint) {
+  try {
+    const res = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${mint}`, {
+      timeout: 8_000,
+      headers: { Accept: 'application/json' },
+    });
+    const pairs = (res.data?.pairs || []).filter((p) => p.chainId === 'robinhood');
+    if (!pairs.length) return null;
+    pairs.sort((a, b) => Number(b.liquidity?.usd || 0) - Number(a.liquidity?.usd || 0));
+    const p = pairs[0];
+    return {
+      labels: p.labels || [],
+      pairAddress: p.pairAddress || '',
+      dexId: p.dexId || '',
+      quoteToken: p.quoteToken?.address || '',
+      liquidityUsd: Number(p.liquidity?.usd || 0),
+    };
+  } catch {
+    return null;
+  }
+}
 
-      const hash = await walletClient.writeContract({
-        ...request,
-        args: [
-          {
-            tokenIn: actualTokenIn,
-            tokenOut,
-            fee,
-            recipient: account.address,
-            amountIn,
-            amountOutMinimum: minOut,
-            sqrtPriceLimitX96: 0n,
-          },
-        ],
-      });
-      const receipt = await publicClient.waitForTransactionReceipt({ hash });
-
-      return {
-        signature: hash,
-        outputAmount: quotedOut.toString(),
-        minOut: minOut.toString(),
-        fee,
-        sizeEth: Number(formatEther(amountIn)),
-        chainId: CHAIN_ID,
-        status: receipt.status,
-      };
-    } catch (err) {
-      lastError = err;
-      continue;
+async function resolveV4Route(meme, { poolIdHint = null, mintCurrencies = null } = {}) {
+  // 1) cache dulu — scan log itu mahal
+  const cached = cachedV4PoolsForMint(meme);
+  if (cached.length) {
+    const best = await pickMostLiquidPool(
+      publicClient,
+      normalizeAddress(UNISWAP_V4_STATE_VIEW),
+      cached
+    );
+    if (best && best.liquidity > 0n) {
+      return { kind: 'v4', poolId: best.poolId, poolKey: best.poolKey, source: 'cache' };
     }
   }
 
-  // Fallback: if input was ETH, unwrap nothing — throw with detail
-  throw new Error(`Swap failed on all fee tiers: ${lastError?.message || 'unknown error'}`);
+  // 2) scan log Initialize (dengan hint poolId DexScreener bila ada)
+  const pm = normalizeAddress(UNISWAP_V4_POOL_MANAGER);
+  const found = await findV4Pools(publicClient, pm, {
+    poolIdHint,
+    currencies: poolIdHint ? null : mintCurrencies,
+  });
+  const supported = [];
+  for (const entry of found) {
+    const { currency0, currency1 } = entry.poolKey;
+    const currencies = [currency0.toLowerCase(), currency1.toLowerCase()];
+    if (!currencies.includes(meme)) continue;
+    const quote = currencies[0] === meme ? currencies[1] : currencies[0];
+    if (quote !== ZERO && quote !== normalizeAddress(WETH_ADDRESS)) continue; // hanya ETH/WETH quote
+    cacheV4Pool(meme, entry.poolId, entry.poolKey, poolIdHint ? 'dex_poolid' : 'logs_scan');
+    supported.push(entry);
+  }
+  if (!supported.length) return null;
+  const best = await pickMostLiquidPool(publicClient, normalizeAddress(UNISWAP_V4_STATE_VIEW), supported);
+  if (!best) return null;
+  return { kind: 'v4', poolId: best.poolId, poolKey: best.poolKey, source: poolIdHint ? 'dex' : 'logs', liquidity: best.liquidity };
 }
 
-export async function checkLiveReserve(needEth) {
-  const balance = await liveWalletBalanceLamports();
-  const need = parseEther(String(needEth));
-  const reserve = parseEther(String(LIVE_MIN_ETH_RESERVE));
-  return {
-    balance,
-    sufficient: balance >= need + reserve,
-    need,
-    reserve,
+async function resolveV3Route(meme, { pairHint = null } = {}) {
+  const factory = normalizeAddress(UNISWAP_V3_FACTORY);
+  const weth = normalizeAddress(WETH_ADDRESS);
+
+  const tiers = [...FEE_TIERS];
+  if (pairHint?.fee != null && !tiers.includes(pairHint.fee)) tiers.unshift(pairHint.fee);
+  if (pairHint?.fee != null) tiers.sort((a, b) => (a === pairHint.fee ? -1 : b === pairHint.fee ? 1 : 0));
+
+  for (const fee of tiers) {
+    let pool;
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      pool = await publicClient.readContract({
+        address: factory,
+        abi: V3_FACTORY_ABI,
+        functionName: 'getPool',
+        args: [meme, weth, fee],
+      });
+    } catch {
+      continue;
+    }
+    if (!pool || normalizeAddress(pool) === ZERO) continue;
+    let liquidity = 0n;
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      liquidity = await publicClient.readContract({
+        address: pool,
+        abi: V3_POOL_ABI,
+        functionName: 'liquidity',
+      });
+    } catch {
+      /* pool aneh — skip */
+    }
+    if (liquidity > 0n) {
+      return { kind: 'v3', fee, pool: normalizeAddress(pool), liquidity, source: pairHint ? 'dex+factory' : 'factory' };
+    }
+  }
+  return null;
+}
+
+/**
+ * Tentukan venue terbaik untuk token meme:
+ *   1. hint DexScreener (labels v4 + 32-byte poolId, atau v3 + pair contract)
+ *   2. cache pool V4
+ *   3. scan factory V3 (cepat, 4 eth_call)
+ *   4. scan log Initialize V4 (mahal, ter-cache setelahnya)
+ */
+export async function resolveSwapRoute(meme, dexPair = null) {
+  if (!/^0x[0-9a-fA-F]{40}$/.test(meme)) throw new Error(`Invalid meme token address: ${meme}`);
+  const hint = dexPair || (await fetchDexPairHint(meme));
+  const hintKind = routeKindFromDexPair(hint);
+
+  if (LIVE_V4_ENABLED && (hintKind === 'v4' || looksLikeV4PoolId(hint?.pairAddress))) {
+    const route = await resolveV4Route(meme, { poolIdHint: hint?.pairAddress });
+    if (route) return route;
+    console.log('[route] dex v4 hint tapi pool tidak ketemu on-chain — fallback');
+  }
+
+  if (hintKind === 'v3' && hint?.pairAddress) {
+    let fee = null;
+    try {
+      fee = Number(
+        await publicClient.readContract({
+          address: normalizeAddress(hint.pairAddress),
+          abi: V3_POOL_ABI,
+          functionName: 'fee',
+        })
+      );
+    } catch {
+      /* bukan pool V3 valid */
+    }
+    const route = await resolveV3Route(meme, { pairHint: fee != null ? { fee } : null });
+    if (route) return route;
+  }
+
+  if (LIVE_V4_ENABLED) {
+    const cached = await resolveV4Route(meme, {});
+    if (cached) return cached;
+  }
+
+  const v3 = await resolveV3Route(meme, {});
+  if (v3) return v3;
+
+  if (LIVE_V4_ENABLED) {
+    // scan semua pool yang memuat meme (quote ETH native maupun WETH)
+    const v4 = await resolveV4Route(meme, { mintCurrencies: [meme, null] });
+    if (v4) return v4;
+  }
+
+  return null;
+}
+
+// ─── Eksekusi V4 (Universal Router, native ETH didukung) ──────────────────────
+
+async function executeSwapV4({ poolKey, amountIn, isNativeIn, memeToken, deadline }) {
+  const { walletClient, account } = ensureWallet();
+  const ur = normalizeAddress(UNISWAP_UNIVERSAL_ROUTER);
+  const amountInBI = BigInt(amountIn);
+
+  await assertContract(ur, 'UNISWAP_UNIVERSAL_ROUTER');
+  await assertContract(normalizeAddress(UNISWAP_V4_POOL_MANAGER), 'UNISWAP_V4_POOL_MANAGER');
+  await assertContract(normalizeAddress(UNISWAP_V4_QUOTER), 'UNISWAP_V4_QUOTER');
+
+  const c0 = poolKey.currency0.toLowerCase();
+  const c1 = poolKey.currency1.toLowerCase();
+  const weth = normalizeAddress(WETH_ADDRESS);
+  const meme = normalizeAddress(memeToken);
+
+  // Currency input: buy = quote pool (ETH native kalau ada, kalau tidak WETH);
+  // sell = token meme. Wajib salah satu currency pool.
+  const currencyIn = isNativeIn ? (c0 === ZERO || c1 === ZERO ? ZERO : weth) : meme;
+  if (c0 !== currencyIn && c1 !== currencyIn) {
+    throw new Error(
+      `Pool V4 tidak memuat currency input ${currencyIn} (c0=${c0}, c1=${c1}) — quote currency tidak didukung.`
+    );
+  }
+  const zeroForOne = c0 === currencyIn;
+  const inputIsErc20 = currencyIn !== ZERO;
+  const currencyInAddress = currencyIn === ZERO ? ZERO : normalizeAddress(currencyIn);
+
+  let wrapped = 0n;
+  try {
+    if (isNativeIn && currencyIn === weth) {
+      // pool ber-quote WETH → wrap deficit, settle via WETH (ERC20 path)
+      const cov = await ensureWethCoverage(amountInBI, parseEther(String(LIVE_MIN_ETH_RESERVE)));
+      wrapped = cov.wrapped;
+    }
+    if (inputIsErc20) {
+      // input ERC20 (WETH hasil wrap atau token meme saat jual) → butuh jalur Permit2
+      await assertContract(normalizeAddress(PERMIT2_ADDRESS), 'PERMIT2_ADDRESS');
+      await ensurePermit2Allowance(currencyInAddress, amountInBI);
+    }
+
+    // QUOTE dulu — tidak ada dana yang berpindah bila gagal
+    const quote = await quoteV4ExactInputSingle(
+      publicClient,
+      normalizeAddress(UNISWAP_V4_QUOTER),
+      { poolKey, zeroForOne, exactAmount: amountInBI }
+    );
+    if (quote.amountOut <= 0n) throw new Error('v4 quote returned 0 — pool mungkin tidak punya likuiditas di arah ini');
+    const minOut = minOutWithSlippage(quote.amountOut, SLIPPAGE_BPS);
+
+    const { commands, inputs } = buildV4SwapInput({
+      poolKey,
+      zeroForOne,
+      amountIn: amountInBI,
+      minOut,
+    });
+
+    const value = currencyIn === ZERO ? amountInBI : 0n;
+
+    // SIMULASI penuh sebelum satu wei bergerak
+    const { request } = await publicClient.simulateContract({
+      address: ur,
+      abi: UNIVERSAL_ROUTER_ABI,
+      functionName: 'execute',
+      args: [commands, inputs, BigInt(deadline)],
+      value,
+      account: account.address,
+    });
+
+    const beforeNative = await publicClient.getBalance({ address: account.address });
+    const beforeToken = !isNativeIn
+      ? 0n
+      : await fetchLiveTokenBalance(memeToken);
+
+    const hash = await walletClient.writeContract(request);
+    const receipt = await publicClient.waitForTransactionReceipt({ hash });
+
+    let received;
+    if (isNativeIn) {
+      const afterToken = await fetchLiveTokenBalance(memeToken);
+      received = afterToken - beforeToken;
+      if (received <= 0n) received = quote.amountOut;
+    } else {
+      const afterNative = await publicClient.getBalance({ address: account.address });
+      const gasCost = BigInt(receipt.gasUsed) * BigInt(receipt.effectiveGasPrice || 0);
+      received = afterNative - beforeNative + gasCost + value;
+      if (received <= 0n) received = quote.amountOut;
+    }
+
+    return {
+      signature: hash,
+      outputAmount: received.toString(),
+      minOut: minOut.toString(),
+      quotedOut: quote.amountOut.toString(),
+      route: 'v4',
+      poolId: poolIdFromKey(poolKey),
+      chainId: CHAIN_ID,
+      status: receipt.status,
+    };
+  } catch (err) {
+    await rollbackWrap(wrapped);
+    throw err;
+  }
+}
+
+// ─── Eksekusi V3 (SwapRouter02, wrap WETH) ────────────────────────────────────
+
+async function executeSwapV3({ route, amountIn, isNativeIn, memeToken, deadline }) {
+  const { walletClient, account } = ensureWallet();
+  const router = normalizeAddress(UNISWAP_ROUTER);
+  const weth = normalizeAddress(WETH_ADDRESS);
+  const amountInBI = BigInt(amountIn);
+
+  await assertContract(router, 'UNISWAP_ROUTER (V3 SwapRouter02)');
+
+  const tokenIn = isNativeIn ? weth : normalizeAddress(memeToken);
+  const tokenOut = isNativeIn ? normalizeAddress(memeToken) : weth;
+
+  let wrapped = 0n;
+  try {
+    if (isNativeIn) {
+      const cov = await ensureWethCoverage(amountInBI, parseEther(String(LIVE_MIN_ETH_RESERVE)));
+      wrapped = cov.wrapped;
+    }
+    await ensureAllowance(tokenIn, router, amountInBI);
+
+    // Dengan saldo+allowance yang sudah nyata, simulasi sekarang akurat.
+    const baseParams = {
+      tokenIn,
+      tokenOut,
+      fee: route.fee,
+      recipient: account.address,
+      amountIn: amountInBI,
+      amountOutMinimum: 0n,
+      sqrtPriceLimitX96: 0n,
+    };
+    const sim = await publicClient.simulateContract({
+      address: router,
+      abi: V3_ROUTER_ABI,
+      functionName: 'exactInputSingle',
+      args: [baseParams],
+      account: account.address,
+    });
+    const quotedOut = BigInt(sim.result);
+    if (quotedOut <= 0n) throw new Error('v3 simulate returned 0 out');
+    const minOut = minOutWithSlippage(quotedOut, SLIPPAGE_BPS);
+
+    const finalParams = { ...baseParams, amountOutMinimum: minOut };
+    const { request } = await publicClient.simulateContract({
+      address: router,
+      abi: V3_ROUTER_ABI,
+      functionName: 'exactInputSingle',
+      args: [finalParams],
+      account: account.address,
+    });
+
+    const beforeToken = isNativeIn ? await fetchLiveTokenBalance(memeToken) : 0n;
+    const beforeWeth = !isNativeIn ? await wethBalance(account.address) : 0n;
+
+    const hash = await walletClient.writeContract(request);
+    const receipt = await publicClient.waitForTransactionReceipt({ hash });
+
+    let received;
+    if (isNativeIn) {
+      const afterToken = await fetchLiveTokenBalance(memeToken);
+      received = afterToken - beforeToken;
+      if (received <= 0n) received = quotedOut;
+    } else {
+      const afterWeth = await wethBalance(account.address);
+      const wethGained = afterWeth - beforeWeth;
+      received = wethGained > 0n ? wethGained : quotedOut;
+      // jual → keluar sebagai WETH; langsung unwrap ke native ETH.
+      // Swap SUDAH sukses di sini — jangan mask kegagalan unwrap sebagai
+      // kegagalan swap (posisi monitor bisa salah menyangka sell gagal).
+      if (wethGained > 0n) {
+        try {
+          await unwrapWeth(wethGained);
+        } catch (unwrapErr) {
+          console.log(`[live] v3 sell unwrap gagal (WETH aman di wallet): ${unwrapErr.message}`);
+        }
+      }
+    }
+
+    return {
+      signature: hash,
+      outputAmount: received.toString(),
+      minOut: minOut.toString(),
+      quotedOut: quotedOut.toString(),
+      route: 'v3',
+      fee: route.fee,
+      pool: route.pool,
+      chainId: CHAIN_ID,
+      status: receipt.status,
+    };
+  } catch (err) {
+    await rollbackWrap(wrapped);
+    throw err;
+  }
+}
+
+/** Revoke approval ERC20 ke spender (berguna membersihkan approve ke alamat mati). */
+export async function revokeApproval(token, spender) {
+  const { walletClient, account } = ensureWallet();
+  const t = normalizeAddress(token);
+  const s = normalizeAddress(spender);
+  const current = await publicClient.readContract({
+    address: t,
+    abi: ERC20_ABI,
+    functionName: 'allowance',
+    args: [account.address, s],
+  });
+  if (BigInt(current) === 0n) return { alreadyZero: true, allowance: '0', hash: null };
+  const hash = await walletClient.writeContract({
+    address: t,
+    abi: ERC20_ABI,
+    functionName: 'approve',
+    args: [s, 0n],
+  });
+  await publicClient.waitForTransactionReceipt({ hash });
+  return { alreadyZero: false, allowance: current.toString(), hash };
+}
+
+// ─── API utama (nama dipertahankan dari Charon) ───────────────────────────────
+
+/**
+ * Execute a swap: inputMint → outputMint untuk `amount` raw unit input.
+ * Native ETH sentinel = 0x000…0000 / null.
+ * Otomatis memilih venue terbaik (V4 native-ETH, V4 WETH, atau V3).
+ */
+export async function executeJupiterSwap({ inputMint, outputMint, amount, dexPair = null, route = null }) {
+  // Name kept similar to Charon (it was Jupiter on Solana); this is Uniswap on RH Chain.
+  ensureWallet();
+  const amountIn = BigInt(amount);
+  const isNativeIn = isNativeSentinel(inputMint);
+  const isNativeOut = isNativeSentinel(outputMint);
+  if (isNativeIn === isNativeOut) {
+    throw new Error(`Swap harus melibatkan tepat satu sisi native ETH (in=${inputMint}, out=${outputMint})`);
+  }
+  const memeToken = normalizeAddress(isNativeIn ? outputMint : inputMint);
+  const deadline = Math.floor(Date.now() / 1000) + SWAP_DEADLINE_SECONDS;
+
+  const resolved = route || (await resolveSwapRoute(memeToken, dexPair));
+  if (!resolved) {
+    throw new Error(
+      `No swap route for ${memeToken} — tidak ada pool V3 (WETH) maupun V4 (ETH) dengan likuiditas.`
+    );
+  }
+
+  console.log(
+    `[live] route ${resolved.kind.toUpperCase()} via ${resolved.source} ` +
+      (resolved.kind === 'v4' ? `poolId ${resolved.poolId?.slice(0, 12)}…` : `fee ${resolved.fee} pool ${resolved.pool?.slice(0, 12)}…`)
+  );
+
+  const params = {
+    amountIn,
+    isNativeIn,
+    memeToken,
+    deadline,
   };
+  const swap =
+    resolved.kind === 'v4'
+      ? await executeSwapV4({ ...params, poolKey: resolved.poolKey })
+      : await executeSwapV3({ ...params, route: resolved });
+
+  swap.sizeEth = Number(formatEther(isNativeIn ? amountIn : 0n));
+  return swap;
 }

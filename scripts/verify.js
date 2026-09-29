@@ -77,6 +77,7 @@ const suites = [
   'scripts/smoke-security.js',
   'scripts/smoke-pons.js',
   'scripts/smoke-learn.js',
+  'scripts/smoke-executor.js',
 ];
 for (const s of suites) {
   if (!existsSync(join(ROOT, s))) {

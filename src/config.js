@@ -23,11 +23,33 @@ export const WETH_ADDRESS = process.env.WETH_ADDRESS || '0x0Bd7D308f8E1639FAb988
 export const USDG_ADDRESS = process.env.USDG_ADDRESS || '0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168';
 export const NATIVE_ETH = '0x0000000000000000000000000000000000000000';
 
-// Uniswap SwapRouter02 (works for V3 exactInputSingle; Universal Router optional)
-export const UNISWAP_ROUTER = process.env.UNISWAP_ROUTER || '0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45';
-export const UNISWAP_QUOTER = process.env.UNISWAP_QUOTER || '0x61fFE014bA17989E743c5F6cB21bF9697530B21e';
-export const UNISWAP_V3_FACTORY = process.env.UNISWAP_V3_FACTORY || '0x33128a8fC17869897dcE68Ed026d694621f6FDfD';
-export const UNISWAP_V4_POOL_MANAGER = process.env.UNISWAP_V4_POOL_MANAGER || '0x0000000000000000000000000000000000000000';
+// Uniswap on Robinhood Chain (chainId 4663).
+// ⚠️ JANGAN pakai alamat canonical Ethereum mainnet di sini — alamat-alamat itu
+// BUKAN kontrak di RH Chain (contoh: SwapRouter02 mainnet 0x68b3...45fc = EOA mati,
+// dana yang di-approve ke sana hangus). Alamat di bawah sudah diverifikasi on-chain:
+//   - SwapRouter02        0xCaf6...5cb2  (verified "SwapRouter02" di Blockscout)
+//   - UniswapV3Factory    0x1f7d...2EfA  (verified "UniswapV3Factory")
+//   - V4 PoolManager      0x8366...0951  (verified "PoolManager")
+//   - V4 UniversalRouter  0x8876...0904  (verified; encoding V4_SWAP standar —
+//                                          dibuktikan byte-identik dengan tx sukses di mainnet)
+//   - V4 Quoter           0x8Dc1...8F94  (official v4-periphery V4Quoter)
+export const UNISWAP_ROUTER = process.env.UNISWAP_ROUTER || '0xCaf681a66D020601342297493863E78C959E5cb2';
+export const UNISWAP_QUOTER = process.env.UNISWAP_QUOTER || ''; // V3 QuoterV2 — belum dikenal di RH; kosong = quote via simulasi
+export const UNISWAP_V3_FACTORY = process.env.UNISWAP_V3_FACTORY || '0x1f7d7550B1b028f7571E69A784071F0205FD2EfA';
+
+// Uniswap V4
+export const UNISWAP_UNIVERSAL_ROUTER = process.env.UNISWAP_UNIVERSAL_ROUTER || '0x8876789976dEcBfCbBbe364623C63652db8C0904';
+export const UNISWAP_V4_POOL_MANAGER = process.env.UNISWAP_V4_POOL_MANAGER || '0x8366a39CC670B4001A1121B8F6A443A643e40951';
+export const UNISWAP_V4_QUOTER = process.env.UNISWAP_V4_QUOTER || '0x8Dc178eFB8111BB0973Dd9d722ebeFF267c98F94';
+export const UNISWAP_V4_STATE_VIEW = process.env.UNISWAP_V4_STATE_VIEW || '0xF3334192D15450CdD385c8B70e03f9a6bD9E673b';
+export const PERMIT2_ADDRESS = process.env.PERMIT2_ADDRESS || '0x000000000022D473030F116dDEE9F6B43aC78BA3';
+export const LIVE_V4_ENABLED = process.env.LIVE_V4_ENABLED !== 'false';
+// Lower bound log-scan: blok deploy protokol Uniswap di RH Chain (hemat RPC getLogs)
+export const V4_DEPLOY_BLOCK = BigInt(process.env.V4_DEPLOY_BLOCK || 7_887_312);
+
+// Live execution safety
+export const SWAP_DEADLINE_SECONDS = Number(process.env.SWAP_DEADLINE_SECONDS || 300);
+export const LIVE_UNWRAP_ON_FAIL = process.env.LIVE_UNWRAP_ON_FAIL !== 'false';
 
 export const SLIPPAGE_BPS = Number(process.env.SLIPPAGE_BPS || 300);
 export const LIVE_MIN_ETH_RESERVE = Number(process.env.LIVE_MIN_ETH_RESERVE || 0.005);
