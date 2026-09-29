@@ -13,11 +13,23 @@ import { sendTelegram, sendPositionOpen } from '../telegram/send.js';
 import { candidateSummary } from '../telegram/format.js';
 import { escapeHtml, fmtEth } from './helpers.js';
 import { LIVE_MIN_ETH_RESERVE, NATIVE_ETH } from '../config.js';
-import { parseEther } from 'viem';
+import { parseEther, formatEther } from 'viem';
 
 /**
  * Execution router: dry_run / confirm / live.
  */
+
+/** Ambil hint pair (labels/pairAddress) dari kandidat untuk routing V3/V4 yang akurat. */
+function dexPairHint(candidate) {
+  const dex = candidate?.trending || candidate?.enriched?.dex || candidate?.dex;
+  if (!dex) return null;
+  return {
+    labels: dex.labels || [],
+    pairAddress: dex.pairAddress || candidate?.token?.pairAddress || '',
+    dexId: dex.dexId || candidate?.token?.dexId || '',
+    quoteToken: dex.quoteToken?.address || dex.quoteTokenAddress || '',
+  };
+}
 
 export async function executeLiveBuy(selectedRow, decision, batchId, rows = [], triggerCandidateId = null) {
   const strat = activeStrategy();
@@ -26,7 +38,9 @@ export async function executeLiveBuy(selectedRow, decision, batchId, rows = [], 
   const reserveCheck = await checkLiveReserve(sizeEth);
   if (!reserveCheck.sufficient) {
     throw new Error(
-      `Insufficient ETH. Need ${sizeEth} ETH + ${LIVE_MIN_ETH_RESERVE} reserve.`
+      `Insufficient balance. Need ${sizeEth} ETH + ${LIVE_MIN_ETH_RESERVE} reserve ` +
+        `(native ${formatEther(reserveCheck.balance)} + WETH ${formatEther(reserveCheck.wethBalance)} ` +
+        `= ${formatEther(reserveCheck.totalBalance)}).`
     );
   }
 
@@ -35,6 +49,7 @@ export async function executeLiveBuy(selectedRow, decision, batchId, rows = [], 
     inputMint: NATIVE_ETH,
     outputMint: selectedRow.candidate.token.mint,
     amount: amountWei,
+    dexPair: dexPairHint(selectedRow.candidate),
   });
 
   if (!swap.outputAmount) {
@@ -111,15 +126,20 @@ export async function executeConfirmedIntent(chatId, intentId, bot) {
     const reserveCheck = await checkLiveReserve(sizeEth);
     if (!reserveCheck.sufficient) {
       updateIntentStatus(intentId, 'rejected_insufficient_balance');
-      return bot.sendMessage(chatId, `Insufficient ETH. Need ${sizeEth} + ${LIVE_MIN_ETH_RESERVE} reserve.`, {
-        parse_mode: 'HTML',
-      });
+      return bot.sendMessage(
+        chatId,
+        `Insufficient balance. Need ${sizeEth} ETH + ${LIVE_MIN_ETH_RESERVE} reserve ` +
+          `(native ${formatEther(reserveCheck.balance)} + WETH ${formatEther(reserveCheck.wethBalance)} ` +
+          `= ${formatEther(reserveCheck.totalBalance)}).`,
+        { parse_mode: 'HTML' }
+      );
     }
 
     const swap = await executeJupiterSwap({
       inputMint: NATIVE_ETH,
       outputMint: freshRow.candidate.token.mint,
       amount: parseEther(String(sizeEth)),
+      dexPair: dexPairHint(freshRow.candidate),
     });
     if (!swap.outputAmount) {
       swap.outputAmount = await fetchLiveTokenBalance(freshRow.candidate.token.mint) || '0';
