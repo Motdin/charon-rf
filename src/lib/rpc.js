@@ -23,15 +23,17 @@ export function rpcEndpoints() {
   return rpcList();
 }
 
-export function createFailoverHttpClient() {
+/** Transport HTTP failover — dipakai bersama read-client DAN wallet client. */
+export function createFailoverHttpTransport() {
   const urls = rpcList();
-  return createPublicClient({
-    chain: CHAIN,
-    transport: fallback(
-      urls.map((url) => http(url, { timeout: 12_000, retryCount: 1 })),
-      { rank: false }
-    ),
-  });
+  return fallback(
+    urls.map((url) => http(url, { timeout: 12_000, retryCount: 1 })),
+    { rank: false }
+  );
+}
+
+export function createFailoverHttpClient() {
+  return createPublicClient({ chain: CHAIN, transport: createFailoverHttpTransport() });
 }
 
 /** WebSocket client untuk newHeads / logs — gagal fallback ke HTTP-only. */
