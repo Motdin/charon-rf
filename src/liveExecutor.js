@@ -33,6 +33,7 @@ import { normalizeAddress } from './utils.js';
 import { publicClient } from './lib/rpc.js';
 import {
   buildV4SwapInput,
+  classifyV4Failure,
   findV4Pools,
   pickMostLiquidPool,
   poolIdFromKey,
@@ -47,7 +48,7 @@ import {
   wrapDeficit,
   reserveVerdict,
 } from './execution/swapMath.js';
-import { cacheV4Pool, cachedV4PoolsForMint } from './db/v4pools.js';
+import { cacheV4Pool, cachedV4PoolsForMint, evictV4Pool } from './db/v4pools.js';
 
 /**
  * Live executor Robinhood Chain.
@@ -101,6 +102,25 @@ const PERMIT2_ABI = parseAbi([
 const FEE_TIERS = [100, 500, 3000, 10000];
 const ZERO = '0x0000000000000000000000000000000000000000';
 const PERMIT2_EXPIRY_S = 30 * 24 * 3600; // 30 hari
+
+/**
+ * Cooldown per-mint untuk kegagalan eksekusi struktural (quote/sim revert).
+ * Mencegah LLM memilih token yang sama berulang-ulang dan memenuhi Telegram
+ * dengan kegagalan yang identik (kasus nyata: pool kembar zero-liq, token
+ * ber-gate). Kedaluwarsa otomatis setelah 30 menit.
+ */
+const MINT_FAIL_COOLDOWN_MS = Number(process.env.LIVE_MINT_FAIL_COOLDOWN_MS || 30 * 60_000);
+const mintFailCooldown = new Map(); // mint → lastFailMs
+
+function blockMint(meme) {
+  mintFailCooldown.set(meme, Date.now());
+}
+
+function mintCooldownLeft(meme) {
+  const last = mintFailCooldown.get(meme);
+  if (!last) return 0;
+  return Math.max(0, MINT_FAIL_COOLDOWN_MS - (Date.now() - last));
+}
 
 let walletClient = null;
 let account = null;
@@ -388,16 +408,38 @@ async function fetchDexPairHint(mint) {
   }
 }
 
+/**
+ * Hanya pool TANPA hooks yang dieksekusi lewat Universal Router stock.
+ * Pool ber-hook di chain ini (mis. BagsV4Hook dengan biaya 2% & rute router
+ * khusus bags) bisa revert di UR resmi — lebih aman dilewati sampai dukungan
+ * hook eksplisit ditambahkan.
+ */
+function filterHooklessPools(pools, meme, seen = new Set()) {
+  const out = [];
+  for (const entry of pools || []) {
+    const hooks = String(entry.poolKey?.hooks || ZERO).toLowerCase();
+    if (hooks !== ZERO) {
+      if (!seen.has('logged:' + meme)) {
+        seen.add('logged:' + meme);
+        console.log(`[route] pool V4 ber-hooks (${hooks.slice(0, 10)}…) untuk ${meme.slice(0, 10)}… dilewati — belum didukung`);
+      }
+      continue;
+    }
+    out.push(entry);
+  }
+  return out;
+}
+
 async function resolveV4Route(meme, { poolIdHint = null, mintCurrencies = null } = {}) {
   // 1) cache dulu — scan log itu mahal
-  const cached = cachedV4PoolsForMint(meme);
+  const cached = filterHooklessPools(cachedV4PoolsForMint(meme), meme);
   if (cached.length) {
     const best = await pickMostLiquidPool(
       publicClient,
       normalizeAddress(UNISWAP_V4_STATE_VIEW),
       cached
     );
-    if (best && best.liquidity > 0n) {
+    if (best) {
       return { kind: 'v4', poolId: best.poolId, poolKey: best.poolKey, source: 'cache' };
     }
   }
@@ -409,7 +451,7 @@ async function resolveV4Route(meme, { poolIdHint = null, mintCurrencies = null }
     currencies: poolIdHint ? null : mintCurrencies,
   });
   const supported = [];
-  for (const entry of found) {
+  for (const entry of filterHooklessPools(found, meme)) {
     const { currency0, currency1 } = entry.poolKey;
     const currencies = [currency0.toLowerCase(), currency1.toLowerCase()];
     if (!currencies.includes(meme)) continue;
@@ -543,9 +585,44 @@ async function executeSwapV4({ poolKey, amountIn, isNativeIn, memeToken, deadlin
   const zeroForOne = c0 === currencyIn;
   const inputIsErc20 = currencyIn !== ZERO;
   const currencyInAddress = currencyIn === ZERO ? ZERO : normalizeAddress(currencyIn);
+  const poolId = poolIdFromKey(poolKey);
+
+  /** Gagal di tahap quote = pool ini tidak bisa dipakai → evict cache + cooldown mint. */
+  function poisonPool(err, prefix) {
+    const cls = classifyV4Failure(err);
+    evictV4Pool(poolId);
+    blockMint(normalizeAddress(memeToken));
+    throw new Error(`${prefix}: ${cls.summary} (pool ${poolId.slice(0, 12)}… dibuang dari cache)`);
+  }
+
+  // 1) QUOTE MURNI DULU — nol side effect on-chain. Kalau pool busuk
+  //    (tidak ter-inisialisasi di PM official / zero-liq / venue lain),
+  //    berhenti di sini sebelum satu wei di-wrap atau satu approval terkirim.
+  let quote;
+  try {
+    quote = await quoteV4ExactInputSingle(
+      publicClient,
+      normalizeAddress(UNISWAP_V4_QUOTER),
+      { poolKey, zeroForOne, exactAmount: amountInBI }
+    );
+  } catch (err) {
+    poisonPool(err, 'V4 quote gagal');
+  }
+  if (quote.amountOut <= 0n) {
+    poisonPool(new Error('quote amountOut = 0'), 'V4 pool tanpa output');
+  }
+  const minOut = minOutWithSlippage(quote.amountOut, SLIPPAGE_BPS);
+
+  const { commands, inputs } = buildV4SwapInput({
+    poolKey,
+    zeroForOne,
+    amountIn: amountInBI,
+    minOut,
+  });
 
   let wrapped = 0n;
   try {
+    // 2) Side effect HANYA setelah quote valid: wrap deficit + approval.
     if (isNativeIn && currencyIn === weth) {
       // pool ber-quote WETH → wrap deficit, settle via WETH (ERC20 path)
       const cov = await ensureWethCoverage(amountInBI, parseEther(String(LIVE_MIN_ETH_RESERVE)));
@@ -557,33 +634,26 @@ async function executeSwapV4({ poolKey, amountIn, isNativeIn, memeToken, deadlin
       await ensurePermit2Allowance(currencyInAddress, amountInBI);
     }
 
-    // QUOTE dulu — tidak ada dana yang berpindah bila gagal
-    const quote = await quoteV4ExactInputSingle(
-      publicClient,
-      normalizeAddress(UNISWAP_V4_QUOTER),
-      { poolKey, zeroForOne, exactAmount: amountInBI }
-    );
-    if (quote.amountOut <= 0n) throw new Error('v4 quote returned 0 — pool mungkin tidak punya likuiditas di arah ini');
-    const minOut = minOutWithSlippage(quote.amountOut, SLIPPAGE_BPS);
-
-    const { commands, inputs } = buildV4SwapInput({
-      poolKey,
-      zeroForOne,
-      amountIn: amountInBI,
-      minOut,
-    });
-
     const value = currencyIn === ZERO ? amountInBI : 0n;
 
-    // SIMULASI penuh sebelum satu wei bergerak
-    const { request } = await publicClient.simulateContract({
-      address: ur,
-      abi: UNIVERSAL_ROUTER_ABI,
-      functionName: 'execute',
-      args: [commands, inputs, BigInt(deadline)],
-      value,
-      account: account.address,
-    });
+    // 3) SIMULASI penuh sebelum satu wei bergerak.
+    let request;
+    try {
+      ({ request } = await publicClient.simulateContract({
+        address: ur,
+        abi: UNIVERSAL_ROUTER_ABI,
+        functionName: 'execute',
+        args: [commands, inputs, BigInt(deadline)],
+        value,
+        account: account.address,
+      }));
+    } catch (err) {
+      const cls = classifyV4Failure(err);
+      // revert tanpa reason pada state yang allowance/saldonya sudah benar →
+      // hampir pasti token punya gate transfer di pool ini → cooldown mint.
+      if (cls.raw === 'empty') blockMint(normalizeAddress(memeToken));
+      throw new Error(`V4 simulate gagal: ${cls.summary} — dana TIDAK bergerak`);
+    }
 
     const beforeNative = await publicClient.getBalance({ address: account.address });
     const beforeToken = !isNativeIn
@@ -652,25 +722,37 @@ async function executeSwapV3({ route, amountIn, isNativeIn, memeToken, deadline 
       amountOutMinimum: 0n,
       sqrtPriceLimitX96: 0n,
     };
-    const sim = await publicClient.simulateContract({
-      address: router,
-      abi: V3_ROUTER_ABI,
-      functionName: 'exactInputSingle',
-      args: [baseParams],
-      account: account.address,
-    });
+    let sim;
+    try {
+      sim = await publicClient.simulateContract({
+        address: router,
+        abi: V3_ROUTER_ABI,
+        functionName: 'exactInputSingle',
+        args: [baseParams],
+        account: account.address,
+      });
+    } catch (err) {
+      const cls = classifyV4Failure(err);
+      throw new Error(`V3 quote/sim gagal: ${cls.summary} — dana TIDAK bergerak`);
+    }
     const quotedOut = BigInt(sim.result);
     if (quotedOut <= 0n) throw new Error('v3 simulate returned 0 out');
     const minOut = minOutWithSlippage(quotedOut, SLIPPAGE_BPS);
 
     const finalParams = { ...baseParams, amountOutMinimum: minOut };
-    const { request } = await publicClient.simulateContract({
-      address: router,
-      abi: V3_ROUTER_ABI,
-      functionName: 'exactInputSingle',
-      args: [finalParams],
-      account: account.address,
-    });
+    let request;
+    try {
+      ({ request } = await publicClient.simulateContract({
+        address: router,
+        abi: V3_ROUTER_ABI,
+        functionName: 'exactInputSingle',
+        args: [finalParams],
+        account: account.address,
+      }));
+    } catch (err) {
+      const cls = classifyV4Failure(err);
+      throw new Error(`V3 simulate(final) gagal: ${cls.summary} — dana TIDAK bergerak`);
+    }
 
     const beforeToken = isNativeIn ? await fetchLiveTokenBalance(memeToken) : 0n;
     const beforeWeth = !isNativeIn ? await wethBalance(account.address) : 0n;
@@ -755,6 +837,13 @@ export async function executeJupiterSwap({ inputMint, outputMint, amount, dexPai
     throw new Error(`Swap harus melibatkan tepat satu sisi native ETH (in=${inputMint}, out=${outputMint})`);
   }
   const memeToken = normalizeAddress(isNativeIn ? outputMint : inputMint);
+  const coolLeft = mintCooldownLeft(memeToken);
+  if (coolLeft > 0) {
+    throw new Error(
+      `${memeToken.slice(0, 12)}… sedang cooldown eksekusi (${Math.ceil(coolLeft / 60000)} menit lagi) — ` +
+        `gagal struktural sebelumnya; dilewati demi keamanan`
+    );
+  }
   const deadline = Math.floor(Date.now() / 1000) + SWAP_DEADLINE_SECONDS;
 
   const resolved = route || (await resolveSwapRoute(memeToken, dexPair));
