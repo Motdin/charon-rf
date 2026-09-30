@@ -37,6 +37,7 @@ export const STRATEGY_FIELDS = {
   max_ath_distance_pct: { label: 'Max ATH distance %', type: 'num', max: 0 },
   trending_min_volume_usd: { label: 'Trending min vol USD', type: 'num', min: 0 },
   max_rug_score: { label: 'Max rug score', type: 'num', min: 0, max: 1 },
+  max_volume_liquidity_ratio: { label: 'Max vol/liq ratio (wash-guard, 0=off)', type: 'num', min: 0 },
   position_size_eth: { label: 'Position size ETH', type: 'num', min: 0 },
   max_open_positions: { label: 'Max open positions', type: 'int', min: 1, max: 20 },
   tp_percent: { label: 'Take profit %', type: 'num' },

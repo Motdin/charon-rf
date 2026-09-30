@@ -1,6 +1,13 @@
 import { createPublicClient, http, parseAbi, formatUnits, getAddress } from 'viem';
-import { CHAIN, RPC_URL, BLOCKSCOUT_API } from '../config.js';
-import { normalizeAddress, toNumber, now, sleep } from '../utils.js';
+import {
+  CHAIN,
+  RPC_URL,
+  BLOCKSCOUT_API,
+  PERMIT2_ADDRESS,
+  UNISWAP_V4_POOL_MANAGER,
+  UNISWAP_UNIVERSAL_ROUTER,
+} from '../config.js';
+import { normalizeAddress, toNumber, now, sleep, isAddress } from '../utils.js';
 import axios from 'axios';
 
 /**
@@ -9,7 +16,10 @@ import axios from 'axios';
  * Checks (all cached, all fail-open to "unknown" so pipeline never stalls):
  *   1. Contract exists + verified on Blockscout
  *   2. Owner / mint authority (owner(), getOwner(), mint capability)
- *   3. Honeypot heuristic — eth_call transfer of a dummy balance
+ *   3. Honeypot probes — eth_call transfer 3 lapis:
+ *      a. akun saldo-nol   (revert KOSONG sebelum cek saldo = gate)
+ *      b. holder EOA nyata (holder tak bisa transfer = jual macet)
+ *      c. Permit2 spender  (jalur persis yg dipakai Universal Router)
  *   4. Transfer tax heuristic — compare expected vs simulated transfer
  *   5. Proxy / upgradeability
  *   6. Suspicious function selectors (mint, blacklist, pause, setFee, rug)
@@ -29,6 +39,7 @@ const ERC20 = parseAbi([
   'function owner() view returns (address)',
   'function getOwner() view returns (address)',
   'function transfer(address to, uint256 amount) returns (bool)',
+  'function transferFrom(address from, address to, uint256 amount) returns (bool)',
   'function allowance(address owner, address spender) view returns (uint256)',
 ]);
 
@@ -61,6 +72,7 @@ function scoreFromFindings(findings) {
     blacklist_selector: 0.25,
     pause_selector: 0.15,
     honeypot_sim_fail: 0.7,
+    suspicious_revert: 0.4,
     high_tax: 0.35,
     proxy_contract: 0.1,
     low_supply: 0.1,
@@ -136,44 +148,188 @@ async function checkSelectors(mint, bytecode) {
   return findings;
 }
 
+// ── Transfer-gate probes (deteksi honeypot) ──────────────────────────────────
+
+const DEAD_ADDRESS = '0x000000000000000000000000000000000000dEaD';
+
 /**
- * Honeypot heuristic: try a tiny eth_call `transfer` from a random address
- * that holds nothing — if the contract reverts on plain transfer for normal
- * users in a way that differs from expected ERC20, flag it.
+ * Klasifikasikan revert dari probe eth_call.
  *
- * We also try `transfer` from a whale (top holder) if we can find one,
- * because many honeypots block only non-whitelisted addresses.
+ * Prinsip: ERC20 SEHAT selalu mengecek saldo/allowance DULUAN — jadi dari akun
+ * tanpa saldo/persetujuan, revert-nya pasti berbunyi balance/allowance
+ * (string OpenZeppelin, custom error ERC20InsufficientBalance 0xe450d38c,
+ * ERC20InsufficientAllowance 0xfb8f41b2, atau panic underflow 0x4e487b71).
+ *
+ * Token ber-gate (honeypot) mengecek whitelist SEBELUM cek saldo → revert
+ * KOSONG tanpa data sama sekali. Inilah signature persis insiden #33:
+ * "V4 simulate gagal: revert tanpa reason" (Gta6HaalandRizzler42069) — Quoter
+ * lolos karena tidak settle, eksekusi nyata macet di gate transfer.
+ */
+export function classifyProbeRevert(err) {
+  const text = [
+    err?.shortMessage,
+    err?.message,
+    err?.details,
+    err?.cause?.message,
+    String(err),
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+  const selectors = text.match(/0x[0-9a-f]{8}\b/g) || [];
+
+  // Custom errors OpenZeppelin 5.x + panic code (underflow pengurangan saldo)
+  if (selectors.includes('0xe450d38c')) return 'balance_check'; // ERC20InsufficientBalance
+  if (selectors.includes('0xfb8f41b2')) return 'allowance_check'; // ERC20InsufficientAllowance
+  if (selectors.includes('0x4e487b71') || /\bpanic\b/.test(text)) return 'panic';
+
+  if (/allowance/.test(text)) return 'allowance_check';
+  if (/balance|insufficient|exceeds|transfer amount/.test(text)) return 'balance_check';
+
+  if (
+    /blacklist|blocklist|frozen|whitelist|not allowed|trading|paused|stopped|disabled|blocked|forbidden|denied|restrict|snipe|is bot/.test(
+      text
+    )
+  ) {
+    return 'gate_message';
+  }
+
+  // Revert polos tanpa reason/data → require(gate) tanpa pesan sebelum cek saldo
+  if (/execution reverted|the contract function|revert/.test(text) && selectors.length === 0) {
+    return 'gate_empty';
+  }
+
+  return 'unknown';
+}
+
+function firstRevertLine(err) {
+  return String(err?.shortMessage || err?.message || err).split('\n')[0].slice(0, 120);
+}
+
+const SKIP_PROBE_HOLDERS = new Set(
+  [
+    '0x0000000000000000000000000000000000000000',
+    DEAD_ADDRESS,
+    UNISWAP_V4_POOL_MANAGER,
+    UNISWAP_UNIVERSAL_ROUTER,
+    PERMIT2_ADDRESS,
+  ]
+    .filter(Boolean)
+    .map((a) => a.toLowerCase())
+);
+
+/** Ambil holder EOA pertama (profil seperti pembeli biasa) dari Blockscout. null = tak ada data. */
+async function pickProbeHolder(mint) {
+  const data = await blockscoutGet(`/v2/tokens/${mint}/holders`);
+  const items = data?.items || [];
+  for (const item of items.slice(0, 10)) {
+    const addr = normalizeAddress(item?.address?.hash || item?.address || '');
+    if (!isAddress(addr) || SKIP_PROBE_HOLDERS.has(addr)) continue;
+    try {
+      if (BigInt(item?.value || '0') <= 0n) continue;
+    } catch {
+      continue;
+    }
+    // Holder kontrak (pool/locker/CEX) bukan profil pembeli — cari EOA.
+    let code = null;
+    try {
+      code = await client.getBytecode({ address: addr });
+    } catch {
+      /* RPC gagal → anggap EOA, probe berikutnya yang memutuskan */
+    }
+    if (code && code !== '0x') continue;
+    return addr;
+  }
+  return null;
+}
+
+/** Probe 1: transfer dari akun SALDO NOL. ERC20 sehat → revert balance; gate → revert kosong. */
+async function probeZeroBalanceTransfer(mint) {
+  try {
+    await client.simulateContract({
+      address: mint,
+      abi: ERC20,
+      functionName: 'transfer',
+      args: [DEAD_ADDRESS, 10n ** 18n],
+      account: '0x0000000000000000000000000000000000000001',
+    });
+    // Sukses padahal saldo 0 → kontrak berbohong soal transfer (whitelist/honeypot)
+    return { kind: 'honeypot_sim_fail', detail: 'transfer succeeded without balance (whitelist/honeypot?)' };
+  } catch (err) {
+    const cls = classifyProbeRevert(err);
+    if (cls === 'balance_check' || cls === 'panic') return null; // perilaku ERC20 normal
+    if (cls === 'gate_message') return { kind: 'honeypot_sim_fail', detail: `transfer gate: ${firstRevertLine(err)}` };
+    if (cls === 'gate_empty') {
+      return {
+        kind: 'honeypot_sim_fail',
+        detail: 'revert TANPA reason sebelum cek saldo — transfer gate (signature honeypot insiden #33)',
+      };
+    }
+    return { kind: 'suspicious_revert', detail: `probe transfer revert tak dikenali: ${firstRevertLine(err)}` };
+  }
+}
+
+/** Probe 2: holder EOA nyata mengirim 1 unit terkecil. Gagal = holder tidak bisa menjual. */
+async function probeRealHolderTransfer(mint, holder) {
+  try {
+    await client.simulateContract({
+      address: mint,
+      abi: ERC20,
+      functionName: 'transfer',
+      args: [DEAD_ADDRESS, 1n],
+      account: holder,
+    });
+    return null; // holder bebas memindahkan token → sehat
+  } catch (err) {
+    const cls = classifyProbeRevert(err);
+    if (cls === 'balance_check' || cls === 'panic') return null; // noise (data holder basi) → tak konklusif
+    return { kind: 'honeypot_sim_fail', detail: `holder EOA tak bisa transfer dust (${cls}) — jual akan macet` };
+  }
+}
+
+/** Probe 3: Permit2 (spender yang dipakai Universal Router) menarik token via transferFrom. */
+async function probePermit2Spender(mint, holder) {
+  try {
+    await client.simulateContract({
+      address: mint,
+      abi: ERC20,
+      functionName: 'transferFrom',
+      args: [holder, DEAD_ADDRESS, 1n],
+      account: PERMIT2_ADDRESS,
+    });
+    // Permit2 ke holder kita tak punya allowance — sukses berarti kontrak mengabaikan allowance
+    return { kind: 'suspicious_revert', detail: 'transferFrom sukses tanpa allowance Permit2 (ERC20 tidak standar)' };
+  } catch (err) {
+    const cls = classifyProbeRevert(err);
+    if (cls === 'allowance_check' || cls === 'balance_check' || cls === 'panic') return null; // cek allowance normal
+    return {
+      kind: 'honeypot_sim_fail',
+      detail: `spender Permit2 diblokir sebelum cek allowance (${cls}) — jalur swap Uniswap macet`,
+    };
+  }
+}
+
+/**
+ * Simulasi transfer 3-lapis (semua fail-open; tak ada data holder ≠ token jahat):
+ *   1. akun saldo-nol       → gate kosong / sukses-aneh terdeteksi
+ *   2. holder EOA nyata     → holder benar-benar bisa menjual
+ *   3. Permit2 sebagai spender → jalur persis yang dipakai live swap
  */
 async function simulateTransfer(mint) {
   const findings = [];
   let taxEstimatePercent = null;
-  try {
-    // Pick a random recipient
-    const to = '0x000000000000000000000000000000000000dEaD';
-    // Simulate transfer of 1 token unit from an arbitrary account that has 0
-    // — expected outcome is revert (insufficient balance). If it REVERTS, that's normal.
-    // A classic honeypot instead returns success with tax or reverts only on sell.
-    // We therefore test `transfer` with a random sender and look for odd revert data.
-    const result = await client.call({
-      account: '0x0000000000000000000000000000000000000001',
-      to: mint,
-      data: `0xa9059cbb000000000000000000000000${to.slice(2).toLowerCase()}${(10n ** 18n).toString(16).padStart(64, '0')}`,
-    });
-    // If call succeeds with no balance, the token is highly suspicious
-    if (result?.data) {
-      findings.push({ kind: 'honeypot_sim_fail', detail: 'transfer succeeded without balance (whitelist/honeypot?)' });
-    }
-  } catch (err) {
-    const msg = String(err?.message || err?.shortMessage || '');
-    // Reverts with "balance" / "exceeds" are healthy ERC20 behaviour
-    const healthy = /balance|exceeds|insufficient|transfer amount/i.test(msg);
-    if (!healthy && msg) {
-      // Custom revert — could be blacklist/honeypot
-      if (/black|pause|stop|frozen|whitelist|not allowed/i.test(msg)) {
-        findings.push({ kind: 'honeypot_sim_fail', detail: msg.slice(0, 120) });
-      }
-    }
+
+  const zero = await probeZeroBalanceTransfer(mint);
+  if (zero) findings.push(zero);
+
+  const holder = await pickProbeHolder(mint);
+  if (holder) {
+    const h = await probeRealHolderTransfer(mint, holder);
+    if (h) findings.push(h);
+    const p = await probePermit2Spender(mint, holder);
+    if (p) findings.push(p);
   }
+
   return { findings, taxEstimatePercent };
 }
 

@@ -140,7 +140,7 @@ Inline keyboard flow:
 - Tap a bool field → toggles instantly (on/off)
 - `/cancel` aborts a pending prompt (3-minute TTL)
 
-`/stratset <id> <key> <value>` still works for the full key list (26 fields).
+`/stratset <id> <key> <value>` still works for the full key list (32 fields).
 
 Every edit is written to the SQLite `strategies.config_json` row and is **hot-read** by
 `activeStrategy()` — the next candidate uses the new values immediately.
@@ -421,11 +421,18 @@ Rug/honeypot enrichment for EVM meme tokens:
 - Contract code exists + Blockscout verification
 - `owner()` / `getOwner()` mint authority (flags EOA owners)
 - Suspicious selectors: `mint`, `blacklist`, `pause`
-- Honeypot heuristic via `eth_call` transfer simulation
+- Honeypot probes — 3-layer `eth_call` transfer simulation:
+  1. **zero-balance account** — a healthy ERC20 reverts with a balance error;
+     a gate checks its whitelist *first* and reverts **with no reason** (this is
+     exactly what makes live V4 simulation fail — funds never move)
+  2. **real EOA holder** — if a top holder can't transfer 1 dust unit, selling is blocked
+  3. **Permit2 as spender** — tests the exact spender path live swaps use
 - Proxy / upgradeability
 - Risk score 0..1 → `PASS` / `WARN` / `FAIL`
 
-Strategy gates: `require_security_pass`, `max_security_risk`.
+Strategy gates: `require_security_pass`, `max_security_risk`. **Verdict `FAIL` is a
+hard floor for every strategy** — a token whose transfers are provably gated is
+rejected no matter how loose the strategy (even `degen` can't buy what can't be sold).
 
 ### Smart money tracking
 
@@ -445,9 +452,19 @@ Optional external APIs (best-effort, may not cover chain 4663):
 A candidate is stronger when **multiple sources agree**:
 
 1. **volume_spike** — DexScreener 5m/24h volume anomaly or txn burst
-2. **new_pool / fresh_pair** — newly created Uniswap pool or young pair
+2. **new_pool / fresh_pair** — newly created Uniswap pool or young pair. The
+   on-chain watcher sees **every new V4 pool the second its `Initialize` event
+   lands** (plus V3 `PoolCreated`), immediately pulls its DexScreener pair data
+   per-token, and caches the poolKey for the executor
 3. **trending** — elevated volume + swaps
-4. **onchain** — Uniswap Swap events on the live watcher
+4. **onchain** — V4/V3 Swap events tracked per-token; a burst of on-chain swaps
+   in a short window counts as a volume-spike-class signal on its own
+
+> ℹ️ **Discovery**: DexScreener's free API has no per-chain trending feed — its
+> keyword search only catches the same large caps by name. Real market discovery
+> therefore comes from the **on-chain watcher (V4 first)** plus
+> `/token-profiles` & `/token-boosts` polls; keyword search is just a
+> background large-cap sampler.
 5. **pons launchpad** — fresh launch / near-graduation from `ponsfamily.com`
    (LP locked at creation, fixed 1B supply, graduation threshold)
 
@@ -500,6 +517,11 @@ node scripts/revoke-weth.js [spender...]         # clean WETH approvals to dead 
 - SL is a *trigger threshold* (polled every `POSITION_CHECK_MS`) — not a
   guaranteed fill; violent memecoin dumps can exit worse than the SL target
 - Rug score (liquidity, holder concentration, age, volume/liq ratio)
+- **Wash-volume guard**: vol24h > 50× liquidity is a wash-trading signature
+  (organic memes turn over 1–25×/day) → auto-reject. Tune per strategy with
+  `/stratset <id> max_volume_liquidity_ratio <n>` (`0` disables, code default 50)
+- 100+ holders with 0% visible top-10 concentration = hidden/sybil distribution
+  → rug-score bump + flagged to the LLM as an anomaly
 - Security gate: honeypot / mint / owner / proxy (`require_security_pass`)
 - Default mode is `dry_run` — no wallet needed
 

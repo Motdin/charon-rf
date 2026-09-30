@@ -1,4 +1,4 @@
-﻿import './_testdb.js';
+import './_testdb.js';
 /**
  * Smoke test â€” runs the pipeline in dry-run without Telegram or live keys.
  * Usage: node scripts/smoke.js
@@ -11,6 +11,8 @@ import { upsertCandidate, storeDecision, storeBatchDecision, recentEligibleCandi
 import { decideCandidateBatch } from '../src/pipeline/llm.js';
 import { estimateRugScore } from '../src/enrichment/blockscout.js';
 import { normalizeDecision } from '../src/pipeline/llm.js';
+import { pickMemeSide, quoteSideIsCurrency0 } from '../src/signals/uniswapEvents.js';
+import { WETH_ADDRESS, USDG_ADDRESS } from '../src/config.js';
 
 function assert(cond, msg) {
   if (!cond) throw new Error(`ASSERT FAIL: ${msg}`);
@@ -79,6 +81,21 @@ console.log('â€” rug score heuristic â€”');
 const rugLow = estimateRugScore({ liquidityUsd: 50000, holderCount: 300, top10Percent: 20, ageMs: 86400_000, volume24h: 30000 });
 const rugHigh = estimateRugScore({ liquidityUsd: 2000, holderCount: 5, top10Percent: 90, ageMs: 600_000, volume24h: 100000 });
 assert(rugLow < rugHigh, `rug score differentiates (${rugLow.toFixed(2)} < ${rugHigh.toFixed(2)})`);
+const rugSybil = estimateRugScore({ liquidityUsd: 20000, holderCount: 150, top10Percent: 0, ageMs: 2 * 86400_000, volume24h: 30000 });
+const rugNormal = estimateRugScore({ liquidityUsd: 20000, holderCount: 150, top10Percent: 30, ageMs: 2 * 86400_000, volume24h: 30000 });
+assert(rugSybil > rugNormal, `0% top10 with many holders bumps rug score (${rugSybil} > ${rugNormal}) — insiden #33 pattern`);
+
+console.log('— on-chain discovery: pickMemeSide (regresi typo WETH) —');
+const meme = '0x' + 'ab'.repeat(20);
+const meme2 = '0x' + 'cd'.repeat(20);
+assert(pickMemeSide(WETH_ADDRESS, meme) === meme.toLowerCase(), 'WETH=token0 → mint=token1 (bug lama selalu token0)');
+assert(pickMemeSide(meme, WETH_ADDRESS) === meme.toLowerCase(), 'WETH=token1 → mint=token0');
+assert(pickMemeSide('0x0000000000000000000000000000000000000000', meme) === meme.toLowerCase(), 'native ETH V4 → mint=token meme');
+assert(pickMemeSide(meme, USDG_ADDRESS) === meme.toLowerCase(), 'USDG quote → mint=token meme');
+assert(pickMemeSide(meme, meme2) === null, 'pool tanpa sisi quote → skip (out of scope)');
+assert(pickMemeSide(WETH_ADDRESS, USDG_ADDRESS) === null, 'kedua sisi quote → skip');
+assert(quoteSideIsCurrency0('0x0000000000000000000000000000000000000000') === true, 'native 0 terdeteksi quote-side');
+assert(quoteSideIsCurrency0(meme) === false, 'token meme bukan quote-side');
 
 console.log('â€” dry-run position lifecycle â€”');
 const beforeCount = openPositionCount();

@@ -107,6 +107,9 @@ export function estimateRugScore({ liquidityUsd, holderCount, top10Percent, ageM
   else if (holderCount < 50) score += 0.1;
   if (top10Percent > 70) score += 0.25;
   else if (top10Percent > 50) score += 0.12;
+  // Holder banyak tapi konsentrasi tak terlihat sama sekali → data disembunyikan
+  // di sumber / supply disebar sybil (signature insiden #33: 380 holder, Top10 0%)
+  if (holderCount >= 100 && top10Percent === 0) score += 0.15;
   if (ageMs != null && ageMs < 3600_000) score += 0.15;
   if (volume24h > 0 && liquidityUsd > 0 && volume24h / liquidityUsd > 20) score += 0.15;
   return Math.min(1, score);

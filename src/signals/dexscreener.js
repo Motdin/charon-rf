@@ -10,8 +10,14 @@ import { storeSignalEvent } from '../db/candidates.js';
 
 /**
  * DexScreener signal source for Robinhood Chain meme tokens.
- * Discovers: trending pairs, volume spikes, new/active pools.
- * These feed the overlap detector alongside on-chain Uniswap events.
+ *
+ * CATATAN ARSITEKTUR: API gratis DexScreener TIDAK punya feed "trending per-chain".
+ * Dua poll pencarian di file ini memakai KEYWORD STATIS (robinhood/pepe/hood/moon/dog)
+ * — itu hanya menangkap large-cap yang namanya cocok (itulah kenapa dulu cuma
+ * ROBINHOOD/MOON/PEPE/HOOD yang muncul). Discovery pasar yang sebenarnya datang dari:
+ *   1. Watcher on-chain V4 Initialize  (semua pool baru, detik itu juga)
+ *   2. /token-profiles + /token-boosts (token berprofil/promosi — incl. scam berbayar)
+ *   3. fetchDexPair(mint) per token    (metrik penuh untuk temuan 1 & 2)
  */
 
 const BASE = 'https://api.dexscreener.com';
@@ -165,11 +171,64 @@ async function pollTokenProfiles() {
         seenAt: now(),
       });
       storeSignalEvent(mint, 'new_pool', 'dexscreener_profiles', item);
-      await maybeTrigger(mint, { hasNewPool: true, route: 'new_pool' });
+
+      // Tarik metrik pasar penuh — profile berbayar sering dipakai scam wash-volume
+      // (insiden #33), dan metrik nyata yang membuat wash-guard bekerja.
+      let sig = null;
+      try {
+        sig = await fetchDexPair(mint);
+      } catch {
+        /* backoff ditangani di dexGet */
+      }
+      if (sig) ingestPairSignal(sig);
+      else await maybeTrigger(mint, { hasNewPool: true, route: 'new_pool' });
     }
   } catch (err) {
     if (isRateLimited(err)) return; // sudah dicatat di dexGet
     console.log(`[dex] profiles: ${err.message}`);
+  }
+}
+
+async function pollTokenBoosts() {
+  // Token boosts — token promosi/berbayar terbaru & teraktif. Di chain kecil,
+  // boost adalah vektor utama token baru terlihat (legit maupun scam).
+  for (const path of ['/token-boosts/latest/v1', '/token-boosts/top/v1']) {
+    if (now() < rateBackoffUntil) return;
+    try {
+      const data = await dexGet(path);
+      const list = Array.isArray(data) ? data : [];
+      for (const item of list.slice(0, 40)) {
+        if (item.chainId !== 'robinhood') continue;
+        const mint = normalizeAddress(item.tokenAddress);
+        if (!mint) continue;
+        const key = `boost:${mint}`;
+        if (seenDiscovery.has(key)) continue;
+        seenDiscovery.set(key, now());
+
+        newPools.set(mint, {
+          mint,
+          name: item.description?.slice(0, 40) || '',
+          symbol: '',
+          kind: 'token_boost',
+          source: 'dexscreener_boosts',
+          seenAt: now(),
+        });
+        storeSignalEvent(mint, 'new_pool', 'dexscreener_boosts', item);
+
+        let sig = null;
+        try {
+          sig = await fetchDexPair(mint);
+        } catch {
+          /* backoff ditangani di dexGet */
+        }
+        if (sig) ingestPairSignal(sig);
+        else await maybeTrigger(mint, { hasNewPool: true, route: 'new_pool' });
+      }
+    } catch (err) {
+      if (isRateLimited(err)) return; // sudah dicatat di dexGet
+      console.log(`[dex] boosts(${path}): ${err.message}`);
+    }
+    await sleep(1500); // sopan ke public API
   }
 }
 
@@ -312,6 +371,7 @@ export async function pollDexScreenerOnce() {
 
   cycleCount++;
   if (cycleCount % 3 === 1) await pollTokenProfiles();
+  if (now() >= rateBackoffUntil && cycleCount % 3 === 2) await pollTokenBoosts();
   if (now() >= rateBackoffUntil) await pollSearchTrending();
   if (now() >= rateBackoffUntil) await pollTopVolume();
 
