@@ -49,6 +49,7 @@ export const V4_DEPLOY_BLOCK = BigInt(process.env.V4_DEPLOY_BLOCK || 7_887_312);
 // Ukuran chunk getLogs saat RPC membatasi rentang blok (drpc free = 10.000).
 // Scanner menurunkan otomatis bila tetap ditolak — nilai ini hanya titik awal.
 export const LOG_SCAN_CHUNK_BLOCKS = Number(process.env.LOG_SCAN_CHUNK_BLOCKS || 10_000);
+export const LOG_SCAN_PACE_MS = Number(process.env.LOG_SCAN_PACE_MS ?? 100);
 
 // Live execution safety
 export const SWAP_DEADLINE_SECONDS = Number(process.env.SWAP_DEADLINE_SECONDS || 300);
