@@ -103,6 +103,9 @@ SLIPPAGE_BPS=300
                    hot-edit any strategy parameter (no restart)
                    e.g. /stratset sniper tp_percent 75
 /positions         open + closed (entry/exit USD price + CA)
+/adopt <mint> [size_eth] [entry_usd]
+                   catat token yang SUDAH ada di wallet sebagai posisi
+                   terpantau (TP/SL aktif). Tidak mengirim transaksi.
 /pnl               win rate + net ETH
 /pnlcard [YYYY-MM-DD]
                    daily PnL card PNG (1200×675) ready for X / Twitter

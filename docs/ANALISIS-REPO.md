@@ -468,3 +468,36 @@ memisahkan penyebab:
 | dua arah OK, Z ≈ X | pool sehat, dulu hanya gagal resolve (bug E-1/E-2) |
 | dua arah OK, Z ≪ X | pajak tinggi / likuiditas nyaris habis |
 | dua arah revert | LP ditarik habis, atau pool hidup di venue lain |
+
+---
+
+## 10. `/adopt` — jaring pengaman untuk token nyasar
+
+Ditambahkan sebagai konsekuensi langsung dari K-0: kalau sebuah pembelian sukses
+on-chain tapi posisinya gagal tercatat, token itu duduk di wallet **tanpa
+TP/SL** dan monitor tidak tahu token itu ada. Sebelumnya tidak ada cara
+memulihkannya selain menulis baris SQL manual.
+
+```
+/adopt <mint> [size_eth] [entry_price_usd]
+```
+
+- Membaca **saldo nyata on-chain** (`balanceOf`) — kalau 0, ditolak.
+- Menyimpan saldo sebagai **string uint256 apa adanya**, tidak lewat `Number()`
+  (pelajaran dari K-1: nilai ≥ 1e21 berubah jadi `"2.5e+24"` dan `BigInt()`
+  melempar saat jual).
+- `execution_mode = 'live'` — token ini nyata, jadi exit harus lewat jalur live.
+- Menolak kalau sudah ada posisi terbuka untuk mint tersebut.
+- `size_eth` default ke ukuran posisi strategi aktif; `entry_price_usd` default
+  ke harga pasar saat ini, dengan **peringatan eksplisit** bahwa PnL dihitung
+  dari titik adopsi, bukan dari harga beli sebenarnya.
+- **Tidak mengirim transaksi apa pun.**
+
+Sebelum mencatat, `/adopt` memanggil `resolveSwapRoute(..., { allowZeroLiquidity: true })`
+dan melaporkan apakah rute exit benar-benar ada. Kalau tidak ada — misalnya LP
+sudah ditarik — posisi tetap dicatat agar terlihat di `/positions`, tapi balasannya
+menyatakan terang-terangan bahwa exit otomatis tidak akan berhasil. Mengadopsi
+token rug tanpa peringatan hanya memberi rasa aman palsu.
+
+Suite baru `scripts/smoke-adopt.js` (16 assert) terdaftar di `npm run verify`,
+dengan fokus pada round-trip presisi uint256 dan integrasi ke `openPositions()`.

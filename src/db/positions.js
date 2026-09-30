@@ -130,6 +130,53 @@ export function createLivePosition(candidateId, candidate, decision, swap, sourc
   });
 }
 
+/**
+ * Adopsi token yang SUDAH ada di wallet menjadi posisi terpantau.
+ *
+ * Dipakai untuk token nyasar: pembelian yang transaksinya sukses on-chain tapi
+ * posisinya tidak pernah tercatat (mis. bug tx-hilang), atau pembelian manual.
+ * Tanpa baris posisi, monitor TP/SL tidak tahu token itu ada dan tidak akan
+ * pernah menjualnya.
+ *
+ * `tokenAmountRaw` WAJIB string uint256 dari saldo on-chain — jangan lewat
+ * Number() (kehilangan presisi + notasi eksponensial pada nilai >= 1e21).
+ */
+export function createAdoptedPosition({
+  mint,
+  symbol,
+  sizeEth,
+  entryPrice,
+  entryMcap,
+  tokenAmountRaw,
+  tokenAmountEst,
+  strategyId,
+  note = '',
+}) {
+  const strat = strategyById(strategyId) || activeStrategy();
+  return baseInsert({
+    candidateId: null,
+    candidate: {
+      token: { mint, symbol: symbol || '', name: symbol || '' },
+      metrics: { priceUsd: entryPrice, marketCapUsd: entryMcap },
+      signals: { route: 'adopted', sourceCount: 0 },
+      filters: { passed: true, failures: [] },
+    },
+    decision: {
+      verdict: 'ADOPTED',
+      confidence: 0,
+      reason: note || 'Diadopsi manual dari saldo wallet — bukan keputusan agent.',
+      risks: ['adopted_position'],
+    },
+    mode: 'live',
+    strategyId: strat.id,
+    sizeEth,
+    entryPrice,
+    entryMcap,
+    tokenAmountEst,
+    tokenAmountRaw: String(tokenAmountRaw),
+  });
+}
+
 export function recordTrade({ positionId, mint, side, price, mcap, sizeEth, tokenAmountEst, reason, payload }) {
   db.prepare(
     `INSERT INTO dry_run_trades (position_id, mint, side, at_ms, price, mcap, size_eth, token_amount_est, reason, payload_json)

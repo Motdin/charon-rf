@@ -11,7 +11,7 @@ import { activeStrategy, allStrategies, strategyById, setActiveStrategy, updateS
 import { candidateSummary, positionSummary } from './format.js';
 import { escapeHtml, fmtEth, fmtPct, fmtUsd, short, now } from '../utils.js';
 import { executeConfirmedIntent, rejectIntent } from '../execution/router.js';
-import { closePositionManually } from '../execution/positions.js';
+import { closePositionManually, adoptWalletPosition } from '../execution/positions.js';
 import { gmgnWeightStatus } from '../enrichment/gmgn.js';
 import { llmStatus } from '../pipeline/llm.js';
 import { addSavedWallet, removeSavedWallet, listSavedWallets } from '../enrichment/wallets.js';
@@ -143,6 +143,7 @@ function helpText() {
     '/stratset &lt;id&gt; &lt;key&gt; &lt;value&gt; — hot-edit strategy param',
     '/positions — open + recent closed',
     '/close <id|symbol|CA> — manual close position',
+    '/adopt <mint> [size_eth] [entry_usd] — track a token already in the wallet',
     '/pnl — simple PnL summary',
     '/pnlcard [YYYY-MM-DD] — shareable daily PnL card (PNG for X)',
     '/pnlcard text [YYYY-MM-DD] — text card ready to copy to X',
@@ -544,6 +545,63 @@ export function startTelegramBot() {
               await sendTelegram(`✅ <b>Posisi #${res.position.id} ditutup manual</b>\n\n${positionSummary(res.position)}`);
             } catch (err) {
               await sendTelegram(`❌ close gagal: ${escapeHtml(err.message)}`, { parse_mode: 'HTML' });
+            }
+            break;
+          }
+
+          case '/adopt': {
+            const mint = (args[0] || '').trim();
+            if (!mint) {
+              await sendTelegram(
+                [
+                  'Usage: <code>/adopt &lt;mint&gt; [size_eth] [entry_price_usd]</code>',
+                  '',
+                  'Angkat token yang SUDAH ada di wallet menjadi posisi terpantau',
+                  '(TP/SL/trailing aktif). Tidak mengirim transaksi apa pun.',
+                  '',
+                  'Untuk token yang pembeliannya sukses on-chain tapi posisinya',
+                  'tidak tercatat, atau pembelian manual di luar bot.',
+                  '',
+                  '<code>size_eth</code> = modal yang dipakai (basis PnL). Default: ukuran posisi strategi aktif.',
+                  '<code>entry_price_usd</code> = harga beli sebenarnya. Default: harga pasar saat ini.',
+                ].join('\n')
+              );
+              break;
+            }
+            await sendTelegram(`⏳ Mengadopsi <code>${escapeHtml(mint)}</code>…`);
+            try {
+              const res = await adoptWalletPosition(mint, {
+                sizeEth: args[1] ? Number(args[1]) : null,
+                entryPriceUsd: args[2] ? Number(args[2]) : null,
+              });
+              if (!res.ok) {
+                await sendTelegram(`❌ ${escapeHtml(res.error)}`);
+                break;
+              }
+              const lines = [
+                `✅ <b>Posisi #${res.positionId} diadopsi</b>`,
+                '',
+                positionSummary(res.position),
+                '',
+                `Saldo on-chain: <code>${escapeHtml(res.balanceRaw)}</code> raw (~${res.tokenAmountEst.toLocaleString()})`,
+                `Basis: ${fmtEth(res.sizeEth)} @ $${res.entryPrice}`,
+              ];
+              if (res.usedMarketPrice) {
+                lines.push(
+                  '⚠️ Entry memakai <b>harga pasar saat ini</b>, bukan harga beli Anda.',
+                  'PnL dihitung dari titik ini. Ulangi dengan harga eksplisit bila perlu.'
+                );
+              }
+              lines.push('', res.sellable ? `🟢 ${escapeHtml(res.routeNote)}` : `🔴 ${escapeHtml(res.routeNote)}`);
+              if (!res.sellable) {
+                lines.push(
+                  'Posisi tetap dicatat agar terlihat di /positions,',
+                  'tapi exit otomatis TIDAK akan berhasil selama rute tidak ada.'
+                );
+              }
+              await sendTelegram(lines.join('\n'));
+            } catch (err) {
+              await sendTelegram(`❌ adopt gagal: ${escapeHtml(err.message)}`);
             }
             break;
           }

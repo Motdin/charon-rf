@@ -7,6 +7,9 @@ import {
   updateTokenAmount,
   recordTrade,
   tradingMode,
+  createAdoptedPosition,
+  hasOpenPositionForMint,
+  openPositionIdForMint,
 } from '../db/positions.js';
 import { strategyById, activeStrategy, numSetting } from '../db/settings.js';
 import { updateCandidateSnapshot } from '../db/candidates.js';
@@ -14,6 +17,7 @@ import { enrichToken } from '../enrichment/index.js';
 import { filterCandidate } from '../pipeline/candidateBuilder.js';
 import { fetchDexPair, trending } from '../signals/dexscreener.js';
 import { executeLiveSell } from './router.js';
+import { fetchLiveTokenBalance, resolveSwapRoute } from '../liveExecutor.js';
 import { sendPositionExit, sendTelegram } from '../telegram/send.js';
 import { now, toNumber, firstPositiveNumber, fmtPct } from '../utils.js';
 import { startBlockWatcher } from '../lib/blockWatcher.js';
@@ -389,5 +393,101 @@ export async function closePositionManually(selector, { reason = 'MANUAL' } = {}
       exit_price: price,
       exit_reason: reason,
     },
+  };
+}
+
+/**
+ * Adopsi token yang sudah ada di wallet menjadi posisi terpantau (/adopt).
+ *
+ * Latar: kalau sebuah pembelian sukses on-chain tapi posisinya gagal tercatat,
+ * token itu duduk di wallet TANPA TP/SL — monitor tidak tahu token itu ada.
+ * /adopt menutup celah itu tanpa mengirim transaksi apa pun.
+ *
+ * Saldo dibaca langsung dari chain sebagai BigInt dan disimpan apa adanya
+ * (string uint256) — tidak lewat Number(), yang akan merusak nilai >= 1e21.
+ */
+export async function adoptWalletPosition(mint, { sizeEth = null, entryPriceUsd = null } = {}) {
+  const addr = String(mint || '').toLowerCase();
+  if (!/^0x[0-9a-f]{40}$/.test(addr)) {
+    return { ok: false, error: 'Alamat token tidak valid (harus 0x + 40 hex).' };
+  }
+  if (hasOpenPositionForMint(addr)) {
+    return { ok: false, error: `Sudah ada posisi terbuka #${openPositionIdForMint(addr)} untuk token ini.` };
+  }
+
+  // 1) Saldo nyata on-chain — ini yang menentukan ada/tidaknya sesuatu untuk diadopsi.
+  let balanceRaw;
+  try {
+    balanceRaw = await fetchLiveTokenBalance(addr);
+  } catch (err) {
+    return { ok: false, error: `Gagal baca saldo token: ${err.message}. Pastikan PRIVATE_KEY terpasang.` };
+  }
+  if (!balanceRaw || balanceRaw <= 0n) {
+    return { ok: false, error: 'Saldo token di wallet = 0 — tidak ada yang bisa diadopsi.' };
+  }
+
+  // 2) Harga/metadata pasar (best-effort — token rug sering sudah hilang dari aggregator).
+  let enriched = null;
+  try {
+    enriched = await enrichToken(addr);
+  } catch {
+    /* lanjut tanpa enrichment */
+  }
+  const decimals = Number(enriched?.meta?.decimals) || 18;
+  const tokenAmountEst = Number(balanceRaw) / 10 ** decimals;
+  const marketPrice = Number(enriched?.metrics?.priceUsd) || 0;
+  const entryPrice = Number(entryPriceUsd) > 0 ? Number(entryPriceUsd) : marketPrice;
+  const entryMcap = Number(enriched?.metrics?.marketCapUsd) || 0;
+
+  if (!(entryPrice > 0)) {
+    return {
+      ok: false,
+      error:
+        'Harga token tidak diketahui (tidak ada di DexScreener/GMGN) dan tidak Anda sebutkan. ' +
+        'Ulangi dengan harga entry eksplisit: /adopt <mint> <size_eth> <entry_price_usd>',
+    };
+  }
+
+  const strat = activeStrategy();
+  const size = Number(sizeEth) > 0 ? Number(sizeEth) : Number(strat.position_size_eth) || 0.05;
+
+  // 3) Apakah token ini benar-benar bisa dijual? Adopsi token rug hanya memberi
+  //    rasa aman palsu — laporkan apa adanya (read-only, tanpa transaksi).
+  let sellable = null;
+  let routeNote = '';
+  try {
+    const route = await resolveSwapRoute(addr, null, { allowZeroLiquidity: true });
+    sellable = Boolean(route);
+    routeNote = route
+      ? `rute exit: ${route.kind.toUpperCase()} via ${route.source}`
+      : 'TIDAK ada rute exit — pool V3/V4 tidak ditemukan (kemungkinan LP sudah ditarik / rug).';
+  } catch (err) {
+    sellable = false;
+    routeNote = `cek rute exit gagal: ${err.message}`;
+  }
+
+  const positionId = createAdoptedPosition({
+    mint: addr,
+    symbol: enriched?.meta?.symbol || addr.slice(0, 8),
+    sizeEth: size,
+    entryPrice,
+    entryMcap,
+    tokenAmountRaw: balanceRaw.toString(),
+    tokenAmountEst,
+    strategyId: strat.id,
+    note: `Adopsi manual dari saldo wallet. ${routeNote}`,
+  });
+
+  return {
+    ok: true,
+    positionId,
+    position: positionById(positionId),
+    sellable,
+    routeNote,
+    balanceRaw: balanceRaw.toString(),
+    tokenAmountEst,
+    entryPrice,
+    usedMarketPrice: !(Number(entryPriceUsd) > 0),
+    sizeEth: size,
   };
 }
