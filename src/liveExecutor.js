@@ -723,6 +723,9 @@ async function executeSwapV4({ poolKey, amountIn, isNativeIn, memeToken, deadlin
     broadcastHash = hash;
     const receipt = await publicClient.waitForTransactionReceipt({ hash });
 
+    // Gas selalu dihitung — PnL yang mengabaikannya optimistis secara sistematis.
+    const gasCost = BigInt(receipt.gasUsed || 0) * BigInt(receipt.effectiveGasPrice || 0);
+
     let received;
     if (isNativeIn) {
       const afterToken = await fetchLiveTokenBalance(memeToken);
@@ -730,7 +733,6 @@ async function executeSwapV4({ poolKey, amountIn, isNativeIn, memeToken, deadlin
       if (received <= 0n) received = quote.amountOut;
     } else {
       const afterNative = await publicClient.getBalance({ address: account.address });
-      const gasCost = BigInt(receipt.gasUsed) * BigInt(receipt.effectiveGasPrice || 0);
       received = afterNative - beforeNative + gasCost + value;
       if (received <= 0n) received = quote.amountOut;
     }
@@ -744,6 +746,7 @@ async function executeSwapV4({ poolKey, amountIn, isNativeIn, memeToken, deadlin
       poolId: poolIdFromKey(poolKey),
       chainId: CHAIN_ID,
       status: receipt.status,
+      gasCostWei: gasCost.toString(),
     };
   } catch (err) {
     throw await finalizeSwapFailure(err, { wrapped, broadcastHash, venue: 'V4' });
@@ -823,6 +826,8 @@ async function executeSwapV3({ route, amountIn, isNativeIn, memeToken, deadline 
     broadcastHash = hash;
     const receipt = await publicClient.waitForTransactionReceipt({ hash });
 
+    const gasCost = BigInt(receipt.gasUsed || 0) * BigInt(receipt.effectiveGasPrice || 0);
+
     let received;
     if (isNativeIn) {
       const afterToken = await fetchLiveTokenBalance(memeToken);
@@ -854,6 +859,7 @@ async function executeSwapV3({ route, amountIn, isNativeIn, memeToken, deadline 
       pool: route.pool,
       chainId: CHAIN_ID,
       status: receipt.status,
+      gasCostWei: gasCost.toString(),
     };
   } catch (err) {
     throw await finalizeSwapFailure(err, { wrapped, broadcastHash, venue: 'V3' });
@@ -889,8 +895,7 @@ export async function revokeApproval(token, spender) {
  * Native ETH sentinel = 0x000…0000 / null.
  * Otomatis memilih venue terbaik (V4 native-ETH, V4 WETH, atau V3).
  */
-export async function executeJupiterSwap({ inputMint, outputMint, amount, dexPair = null, route = null }) {
-  // Name kept similar to Charon (it was Jupiter on Solana); this is Uniswap on RH Chain.
+export async function executeSwap({ inputMint, outputMint, amount, dexPair = null, route = null }) {
   ensureWallet();
   const amountIn = BigInt(amount);
   const isNativeIn = isNativeSentinel(inputMint);

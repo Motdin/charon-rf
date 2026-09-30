@@ -379,7 +379,7 @@ await okAsync('pickMostLiquidPool: pool HANTU (getLiquidity revert) tetap ditola
 
 ok('cooldown kegagalan hanya memblok BELI, tidak memblok JUAL', () => {
   const src = readFileSync(new URL('../src/liveExecutor.js', import.meta.url), 'utf8');
-  const body = src.slice(src.indexOf('export async function executeJupiterSwap'));
+  const body = src.slice(src.indexOf('export async function executeSwap'));
   const guard = body.slice(0, body.indexOf('const deadline'));
   const coolIdx = guard.indexOf('mintCooldownLeft(memeToken)');
   const buyOnlyIdx = guard.indexOf('if (isNativeIn)');
@@ -394,7 +394,7 @@ ok('resolveSwapRoute melonggarkan gate likuiditas khusus untuk jual', () => {
   const src = readFileSync(new URL('../src/liveExecutor.js', import.meta.url), 'utf8');
   assert.ok(
     /resolveSwapRoute\(memeToken, dexPair, \{ allowZeroLiquidity: !isNativeIn \}\)/.test(src),
-    'executeJupiterSwap harus meneruskan allowZeroLiquidity untuk sisi jual'
+    'executeSwap harus meneruskan allowZeroLiquidity untuk sisi jual'
   );
 });
 

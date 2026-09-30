@@ -2,6 +2,7 @@ import { db } from './connection.js';
 import { now, json, parseJson } from '../utils.js';
 import { numSetting, setting, strategyById, activeStrategy } from './settings.js';
 import { toRawAmountString } from '../execution/swapMath.js';
+import { ethUsdPrice } from '../enrichment/ethPrice.js';
 
 export function tradingMode() {
   return setting('trading_mode', process.env.TRADING_MODE || 'dry_run');
@@ -95,7 +96,7 @@ export function createDryRunPosition(candidateId, candidate, decision, source = 
   const sizeEth = strat.position_size_eth ?? numSetting('dry_run_buy_eth', 0.05);
   const entryPrice = Number(candidate.metrics?.priceUsd) || 0;
   const entryMcap = Number(candidate.metrics?.marketCapUsd) || 0;
-  const tokenAmountEst = entryPrice > 0 ? (sizeEth * 2500) / entryPrice : 0;
+  const tokenAmountEst = entryPrice > 0 ? (sizeEth * ethUsdPrice()) / entryPrice : 0;
   return baseInsert({
     candidateId,
     candidate,
@@ -115,7 +116,11 @@ export function createLivePosition(candidateId, candidate, decision, swap, sourc
   const sizeEth = swap.sizeEth ?? strat.position_size_eth ?? 0.05;
   const entryPrice = Number(candidate.metrics?.priceUsd) || 0;
   const entryMcap = Number(candidate.metrics?.marketCapUsd) || 0;
-  const tokenAmountEst = swap.outputAmount ? Number(swap.outputAmount) / 1e18 : entryPrice > 0 ? (sizeEth * 2500) / entryPrice : 0;
+  const tokenAmountEst = swap.outputAmount
+    ? Number(swap.outputAmount) / 1e18
+    : entryPrice > 0
+      ? (sizeEth * ethUsdPrice()) / entryPrice
+      : 0;
   return baseInsert({
     candidateId,
     candidate,
@@ -217,6 +222,33 @@ export function updateHighWater({ id, highWaterPrice, highWaterMcap, trailingArm
 
 export function markPartialTpDone(id) {
   db.prepare('UPDATE dry_run_positions SET partial_tp_done = 1 WHERE id = ?').run(id);
+}
+
+/** Akumulasi biaya gas (ETH) pada sebuah posisi. */
+export function addPositionGas(id, gasEth) {
+  const g = Number(gasEth);
+  if (!Number.isFinite(g) || g <= 0) return;
+  db.prepare('UPDATE dry_run_positions SET gas_eth = COALESCE(gas_eth, 0) + ? WHERE id = ?').run(g, id);
+}
+
+/** Akumulasi ETH yang sudah direalisasikan lewat partial TP. */
+export function addRealizedProceeds(id, proceedsEth) {
+  const amount = Number(proceedsEth);
+  if (!Number.isFinite(amount) || amount <= 0) return;
+  db.prepare(
+    'UPDATE dry_run_positions SET realized_proceeds_eth = COALESCE(realized_proceeds_eth, 0) + ? WHERE id = ?'
+  ).run(amount, id);
+}
+
+export function realizedProceedsEth(id) {
+  return Number(
+    db.prepare('SELECT realized_proceeds_eth FROM dry_run_positions WHERE id = ?').get(id)?.realized_proceeds_eth || 0
+  );
+}
+
+/** Gas kumulatif sebuah posisi (ETH). */
+export function positionGasEth(id) {
+  return Number(db.prepare('SELECT gas_eth FROM dry_run_positions WHERE id = ?').get(id)?.gas_eth || 0);
 }
 
 export function updateTokenAmount(id, amountRaw) {

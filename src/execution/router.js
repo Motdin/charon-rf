@@ -3,11 +3,12 @@ import {
   createLivePosition,
   canOpenMorePositions,
   openPositionCount,
+  addPositionGas,
 } from '../db/positions.js';
 import { intentById, updateIntentStatus } from '../db/intents.js';
 import { logDecisionEvent, updateCandidateStatus } from '../db/candidates.js';
 import { activeStrategy, numSetting } from '../db/settings.js';
-import { executeJupiterSwap, liveWalletBalanceLamports, fetchLiveTokenBalance, checkLiveReserve } from '../liveExecutor.js';
+import { executeSwap, liveWalletBalanceLamports, fetchLiveTokenBalance, checkLiveReserve } from '../liveExecutor.js';
 import { refreshCandidateForExecution } from './positions.js';
 import { sendTelegram, sendPositionOpen } from '../telegram/send.js';
 import { candidateSummary } from '../telegram/format.js';
@@ -45,7 +46,7 @@ export async function executeLiveBuy(selectedRow, decision, batchId, rows = [], 
   }
 
   const amountWei = parseEther(String(sizeEth));
-  const swap = await executeJupiterSwap({
+  const swap = await executeSwap({
     inputMint: NATIVE_ETH,
     outputMint: selectedRow.candidate.token.mint,
     amount: amountWei,
@@ -58,6 +59,7 @@ export async function executeLiveBuy(selectedRow, decision, batchId, rows = [], 
   swap.sizeEth = sizeEth;
 
   const positionId = createLivePosition(selectedRow.id, selectedRow.candidate, decision, swap, `live_batch_${batchId}`);
+  if (swap.gasCostWei) addPositionGas(positionId, Number(formatEther(BigInt(swap.gasCostWei))));
 
   logDecisionEvent({
     batchId,
@@ -82,7 +84,7 @@ export async function executeLiveBuy(selectedRow, decision, batchId, rows = [], 
 export async function executeLiveSell(position, reason) {
   const amount = position.token_amount_raw || position.token_amount_est;
   if (!amount || Number(amount) <= 0) throw new Error('Live position has no token amount to sell.');
-  return executeJupiterSwap({
+  return executeSwap({
     inputMint: position.mint,
     outputMint: NATIVE_ETH,
     amount: BigInt(String(amount)),
@@ -135,7 +137,7 @@ export async function executeConfirmedIntent(chatId, intentId, bot) {
       );
     }
 
-    const swap = await executeJupiterSwap({
+    const swap = await executeSwap({
       inputMint: NATIVE_ETH,
       outputMint: freshRow.candidate.token.mint,
       amount: parseEther(String(sizeEth)),
@@ -147,6 +149,7 @@ export async function executeConfirmedIntent(chatId, intentId, bot) {
     swap.sizeEth = sizeEth;
 
     const positionId = createLivePosition(intent.candidate_id, freshRow.candidate, decision, swap, `confirmed_intent_${intentId}`);
+    if (swap.gasCostWei) addPositionGas(positionId, Number(formatEther(BigInt(swap.gasCostWei))));
     updateIntentStatus(intentId, 'executed_live');
 
     logDecisionEvent({

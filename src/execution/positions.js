@@ -10,6 +10,10 @@ import {
   createAdoptedPosition,
   hasOpenPositionForMint,
   openPositionIdForMint,
+  addPositionGas,
+  positionGasEth,
+  addRealizedProceeds,
+  realizedProceedsEth,
 } from '../db/positions.js';
 import { strategyById, activeStrategy, numSetting } from '../db/settings.js';
 import { updateCandidateSnapshot } from '../db/candidates.js';
@@ -95,6 +99,10 @@ export async function refreshPosition(position, { autoExit = true } = {}) {
             { ...position, token_amount_raw: sellAmount.toString() },
             'PARTIAL_TP'
           );
+          // Realisasi partial harus masuk PnL final; sebelumnya hasil jual ini
+          // menghilang dari pembukuan sehingga PnL terlihat terlalu rendah.
+          if (sell.outputAmount) addRealizedProceeds(position.id, Number(sell.outputAmount) / 1e18);
+          if (sell.gasCostWei) addPositionGas(position.id, Number(sell.gasCostWei) / 1e18);
           const remaining = BigInt(position.token_amount_raw) - sellAmount;
           updateTokenAmount(position.id, remaining.toString());
           // Baru DI SINI ditandai selesai — dulu ditandai sebelum jual, jadi
@@ -179,11 +187,19 @@ export async function refreshPosition(position, { autoExit = true } = {}) {
     } finally {
       sellInProgress.delete(position.id);
     }
+    // Gas exit dicatat, lalu PnL dihitung NET: hasil jual − modal − gas total.
+    if (sell.gasCostWei) {
+      addPositionGas(position.id, Number(sell.gasCostWei) / 1e18);
+    }
+    const gasEth = positionGasEth(position.id);
+    const realizedEth = realizedProceedsEth(position.id);
+
     const receivedWei = Number(sell.outputAmount || 0);
     const receivedEth = receivedWei > 0 ? receivedWei / 1e18 : null;
     if (receivedEth != null) {
-      finalPnlEth = receivedEth - Number(position.size_eth);
-      finalPnlPercent = (receivedEth / Number(position.size_eth) - 1) * 100;
+      const sizeEth = Number(position.size_eth);
+      finalPnlEth = receivedEth + realizedEth - sizeEth - gasEth;
+      finalPnlPercent = sizeEth > 0 ? (finalPnlEth / sizeEth) * 100 : 0;
     }
 
     closePosition({
@@ -204,7 +220,7 @@ export async function refreshPosition(position, { autoExit = true } = {}) {
       sizeEth: position.size_eth,
       tokenAmountEst: position.token_amount_est,
       reason: exitReason,
-      payload: { pnlPercent: finalPnlPercent, pnlEth: finalPnlEth, receivedEth, sell },
+      payload: { pnlPercent: finalPnlPercent, pnlEth: finalPnlEth, receivedEth, realizedEth, gasEth, sell },
     });
     closed = true;
   } else if (exitReason && autoExit) {
@@ -381,13 +397,19 @@ export async function closePositionManually(selector, { reason = 'MANUAL' } = {}
   if (position.execution_mode === 'live') {
     const sell = await executeLiveSell(position, reason);
     exitSignature = sell.signature;
+    if (sell.gasCostWei) {
+      addPositionGas(position.id, Number(sell.gasCostWei) / 1e18);
+    }
     const wei = Number(sell.outputAmount || 0);
     if (wei > 0) receivedEth = wei / 1e18;
   }
 
-  const finalPnlEth = receivedEth != null ? receivedEth - Number(position.size_eth) : pnlEth;
+  const gasEth = positionGasEth(position.id);
+  const realizedEth = realizedProceedsEth(position.id);
+  const sizeEthNum = Number(position.size_eth);
+  const finalPnlEth = receivedEth != null ? receivedEth + realizedEth - sizeEthNum - gasEth : pnlEth;
   const finalPnlPct =
-    receivedEth != null ? (receivedEth / Number(position.size_eth) - 1) * 100 : pnlPercent;
+    receivedEth != null && sizeEthNum > 0 ? (finalPnlEth / sizeEthNum) * 100 : pnlPercent;
 
   closePosition({
     id: position.id,
@@ -408,7 +430,7 @@ export async function closePositionManually(selector, { reason = 'MANUAL' } = {}
     sizeEth: position.size_eth,
     tokenAmountEst: position.token_amount_est,
     reason,
-    payload: { manual: true, pnlPercent: finalPnlPct, pnlEth: finalPnlEth, receivedEth, exitSignature },
+    payload: { manual: true, pnlPercent: finalPnlPct, pnlEth: finalPnlEth, receivedEth, realizedEth, gasEth, exitSignature },
   });
 
   return {

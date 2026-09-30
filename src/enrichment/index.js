@@ -196,12 +196,26 @@ export function marketAnomalies(m) {
   return out;
 }
 
+/**
+ * Data token adalah input attacker-controlled. Batasi/control-normalize sebelum
+ * memasukkannya ke prompt agar nama/simbol seperti "ignore previous..." tidak
+ * punya ruang untuk menyelundupkan instruksi panjang. Keputusan tetap harus
+ * ditautkan ke candidate_id + mint server-side.
+ */
+export function safeLlmText(value, maxLength = 96) {
+  return String(value ?? '')
+    .replace(/[\u0000-\u001f\u007f]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, maxLength);
+}
+
 export function compactForLlm(enriched, filters, signals) {
   const m = enriched.metrics;
   return {
     mint: enriched.meta?.address || enriched.dex?.mint || enriched.gmgn?.address,
-    symbol: enriched.meta.symbol,
-    name: enriched.meta.name,
+    symbol: safeLlmText(enriched.meta.symbol, 32),
+    name: safeLlmText(enriched.meta.name, 96),
     signals,
     dataSources: enriched.sources,
     anomalies: marketAnomalies(m),
@@ -210,7 +224,7 @@ export function compactForLlm(enriched, filters, signals) {
           verdict: enriched.security.verdict,
           riskScore: enriched.security.riskScore,
           owner: enriched.security.owner ? 'present' : 'none',
-          findings: (enriched.security.findings || []).map((f) => f.detail).slice(0, 5),
+          findings: (enriched.security.findings || []).map((f) => safeLlmText(f.detail, 160)).slice(0, 5),
         }
       : null,
     smartMoney: {

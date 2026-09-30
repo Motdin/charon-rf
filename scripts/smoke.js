@@ -1,6 +1,6 @@
 import './_testdb.js';
 /**
- * Smoke test â€” runs the pipeline in dry-run without Telegram or live keys.
+ * Smoke test — runs the pipeline in dry-run without Telegram or live keys.
  * Usage: node scripts/smoke.js
  */
 import { initDb } from '../src/db/connection.js';
@@ -16,13 +16,13 @@ import { WETH_ADDRESS, USDG_ADDRESS } from '../src/config.js';
 
 function assert(cond, msg) {
   if (!cond) throw new Error(`ASSERT FAIL: ${msg}`);
-  console.log(`  âœ“ ${msg}`);
+  console.log(`  ✓ ${msg}`);
 }
 
-console.log('â€” init db â€”');
+console.log('— init db —');
 initDb();
 
-console.log('â€” strategies seeded â€”');
+console.log('— strategies seeded —');
 const sniper = activeStrategy();
 assert(sniper.id === 'sniper', `default strategy is sniper (${sniper.id})`);
 assert(sniper.min_source_count === 2, 'sniper requires 2 sources');
@@ -34,7 +34,7 @@ assert(degen.id === 'degen', 'degen activates');
 assert(degen.use_llm === false, 'degen is rule-based');
 setActiveStrategy('sniper');
 
-console.log('â€” filter: reject low mcap â€”');
+console.log('— filter: reject low mcap —');
 const bad = {
   token: { mint: '0x' + '11'.repeat(20), symbol: 'BAD', name: 'Bad' },
   metrics: {
@@ -52,7 +52,7 @@ const bad = {
 const badF = filterCandidate(bad);
 assert(badF.passed === false, `bad candidate rejected (${badF.failures.length} failures)`);
 
-console.log('â€” filter: accept strong overlap â€”');
+console.log('— filter: accept strong overlap —');
 const good = {
   token: { mint: '0x' + '22'.repeat(20), symbol: 'GOOD', name: 'Good' },
   metrics: {
@@ -77,7 +77,7 @@ const good = {
 const goodF = filterCandidate(good);
 assert(goodF.passed === true, `good candidate passed filters`);
 
-console.log('â€” rug score heuristic â€”');
+console.log('— rug score heuristic —');
 const rugLow = estimateRugScore({ liquidityUsd: 50000, holderCount: 300, top10Percent: 20, ageMs: 86400_000, volume24h: 30000 });
 const rugHigh = estimateRugScore({ liquidityUsd: 2000, holderCount: 5, top10Percent: 90, ageMs: 600_000, volume24h: 100000 });
 assert(rugLow < rugHigh, `rug score differentiates (${rugLow.toFixed(2)} < ${rugHigh.toFixed(2)})`);
@@ -97,7 +97,7 @@ assert(pickMemeSide(WETH_ADDRESS, USDG_ADDRESS) === null, 'kedua sisi quote → 
 assert(quoteSideIsCurrency0('0x0000000000000000000000000000000000000000') === true, 'native 0 terdeteksi quote-side');
 assert(quoteSideIsCurrency0(meme) === false, 'token meme bukan quote-side');
 
-console.log('â€” dry-run position lifecycle â€”');
+console.log('— dry-run position lifecycle —');
 const beforeCount = openPositionCount();
 assert(canOpenMorePositions() || beforeCount < numSetting('max_open_positions', 3) || true, 'can evaluate open positions');
 const posId = createDryRunPosition(1, { ...good, token: { ...good.token, mint: '0x' + '22'.repeat(20) } }, {
@@ -107,14 +107,14 @@ const posId = createDryRunPosition(1, { ...good, token: { ...good.token, mint: '
   risks: [],
 }, 'smoke');
 assert(typeof posId === 'number' && posId > 0, `position created id=${posId}`);
-assert(openPositionCount() === beforeCount + 1, `open position count ${beforeCount} â†’ ${openPositionCount()}`);
+assert(openPositionCount() === beforeCount + 1, `open position count ${beforeCount} → ${openPositionCount()}`);
 const open = openPositions();
 const found = open.find((p) => p.id === posId);
 assert(found, 'openPositions returns the new position');
 assert(found.tp_percent === 50, 'TP copied from strategy (50%)');
 assert(found.sl_percent === -25, 'SL copied from strategy (-25%)');
 
-console.log('â€” candidate upsert + decision store â€”');
+console.log('— candidate upsert + decision store —');
 const cid = upsertCandidate({ ...good, filters: goodF }, 'smoke-key-1');
 assert(cid > 0, `candidate upserted id=${cid}`);
 const row = candidateById(cid);
@@ -131,11 +131,11 @@ const bid = storeBatchDecision(cid, [{ id: cid, candidate: good }], {
 });
 assert(bid > 0, `batch decision stored id=${bid}`);
 
-console.log('â€” LLM disabled fallback â€”');
+console.log('— LLM disabled fallback —');
 const batch = await decideCandidateBatch([{ id: cid, candidate: good, filters: goodF }], cid);
 assert(batch.verdict === 'WATCH', 'LLM disabled returns WATCH');
 
-console.log('â€” normalizeDecision clamps â€”');
+console.log('— normalizeDecision clamps —');
 const nd = normalizeDecision({ verdict: 'buy', confidence: 150, reason: 'x', risks: 'nope' });
 assert(nd.verdict === 'BUY', 'verdict uppercased');
 assert(nd.confidence === 100, 'confidence clamped to 100');

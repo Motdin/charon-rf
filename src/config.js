@@ -60,6 +60,13 @@ export const LIVE_MIN_ETH_RESERVE = Number(process.env.LIVE_MIN_ETH_RESERVE || 0
 
 export const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 export const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+// Allowlist user ID (pisah koma). Cek chat.id saja TIDAK cukup bila
+// TELEGRAM_CHAT_ID menunjuk ke GRUP: tanpa ini setiap anggota grup bisa
+// menjalankan /mode live, /confirm, /close, /stratset. Kosong = hanya cek chat.
+export const TELEGRAM_ALLOWED_USER_IDS = (process.env.TELEGRAM_ALLOWED_USER_IDS || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 export const PRIVATE_KEY = process.env.PRIVATE_KEY || '';
 export const TRADING_MODE = process.env.TRADING_MODE || 'dry_run';
@@ -118,6 +125,11 @@ export const CHAIN = {
 export function validateConfig() {
   if (!TELEGRAM_BOT_TOKEN) throw new Error('TELEGRAM_BOT_TOKEN is required.');
   if (!TELEGRAM_CHAT_ID) throw new Error('TELEGRAM_CHAT_ID is required.');
+  // Telegram group/supergroup IDs negatif. Membiarkan allowlist kosong di grup
+  // berarti setiap anggota bisa menjalankan perintah finansial.
+  if (String(TELEGRAM_CHAT_ID).startsWith('-') && !TELEGRAM_ALLOWED_USER_IDS.length) {
+    throw new Error('TELEGRAM_ALLOWED_USER_IDS is required when TELEGRAM_CHAT_ID is a group.');
+  }
   if (TRADING_MODE === 'live' && !PRIVATE_KEY) {
     throw new Error('PRIVATE_KEY is required for live trading.');
   }

@@ -1,6 +1,6 @@
-﻿import './_testdb.js';
+import './_testdb.js';
 /**
- * Smoke: interactive pending-edit flow (tap â†’ type value â†’ hot-save).
+ * Smoke: interactive pending-edit flow (tap → type value → hot-save).
  * Usage: node scripts/smoke-interactive.js
  */
 import { initDb } from '../src/db/connection.js';
@@ -19,23 +19,23 @@ import {
 
 function assert(cond, msg) {
   if (!cond) throw new Error(`ASSERT FAIL: ${msg}`);
-  console.log(`  âœ“ ${msg}`);
+  console.log(`  ✓ ${msg}`);
 }
 
 initDb();
 const CHAT = '999';
 
-console.log('â€” parseValue guards â€”');
+console.log('— parseValue guards —');
 assert(parseValue('tp_percent', '75').ok === true, 'tp_percent 75 ok');
 assert(parseValue('tp_percent', 'abc').ok === false, 'reject non-numeric');
 assert(parseValue('sl_percent', '10').ok === false, 'sl_percent max is 0, reject +10');
-assert(parseValue('require_volume_spike', 'on').value === true, 'bool on â†’ true');
-assert(parseValue('require_volume_spike', 'off').value === false, 'bool off â†’ false');
+assert(parseValue('require_volume_spike', 'on').value === true, 'bool on → true');
+assert(parseValue('require_volume_spike', 'off').value === false, 'bool off → false');
 assert(parseValue('entry_mode', 'wait_for_dip').ok === true, 'enum ok');
 assert(parseValue('entry_mode', 'yolo').ok === false, 'enum reject unknown');
 assert(parseValue('nope_field', '1').ok === false, 'unknown field rejected');
 
-console.log('â€” pending edit lifecycle â€”');
+console.log('— pending edit lifecycle —');
 clearPendingEdit(CHAT);
 assert(hasPendingEdit(CHAT) === false, 'no pending initially');
 
@@ -61,20 +61,20 @@ s.tp_percent = 50;
 updateStrategyConfig('sniper', s);
 assert(strategyById('sniper').tp_percent === 50, 'restored to 50');
 
-console.log('â€” invalid value keeps pending â€”');
+console.log('— invalid value keeps pending —');
 setPendingEdit(CHAT, 'sniper', 'tp_percent');
 const bad = applyPendingEdit(CHAT, 'not-a-number');
 assert(bad.ok === false, 'invalid value rejected');
 assert(hasPendingEdit(CHAT) === true, 'pending kept so user can retry');
 clearPendingEdit(CHAT);
 
-console.log('â€” bool toggle instant â€”');
+console.log('— bool toggle instant —');
 const before = strategyById('sniper').trailing_enabled;
 const toggled = toggleBoolField('sniper', 'trailing_enabled');
-assert(toggled.value === !before, `trailing_enabled toggled ${before} â†’ ${toggled.value}`);
+assert(toggled.value === !before, `trailing_enabled toggled ${before} → ${toggled.value}`);
 toggleBoolField('sniper', 'trailing_enabled'); // restore
 
-console.log('â€” expires after TTL â€”');
+console.log('— expires after TTL —');
 setPendingEdit(CHAT, 'sniper', 'max_open_positions');
 // force expire
 const st = getPendingEdit(CHAT);

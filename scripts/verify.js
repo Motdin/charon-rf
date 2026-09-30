@@ -78,6 +78,7 @@ const suites = [
   'scripts/smoke-pons.js',
   'scripts/smoke-learn.js',
   'scripts/smoke-adopt.js',
+  'scripts/smoke-hardening.js',
   'scripts/smoke-executor.js',
 ];
 for (const s of suites) {

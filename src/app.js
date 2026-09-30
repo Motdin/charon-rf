@@ -11,6 +11,7 @@ import { processCandidateFromSignals } from './pipeline/orchestrator.js';
 import { startPositionMonitor } from './execution/positions.js';
 import { startTelegramBot } from './telegram/send.js';
 import { gmgnWeightStatus } from './enrichment/gmgn.js';
+import { startEthPricePolling } from './enrichment/ethPrice.js';
 import { rpcEndpoints } from './lib/rpc.js';
 
 /**
@@ -75,6 +76,9 @@ export async function startCharon() {
   setPonsCandidateHandler(processCandidateFromSignals);
 
   // Start collectors + monitors
+  // Harga ETH/USD dipakai untuk estimasi jumlah token — jangan pakai angka mati.
+  startEthPricePolling();
+
   startDexScreenerPolling();
   startOnchainPolling();
   startPriceMonitor(20_000);

@@ -559,3 +559,60 @@ uint256 dari receipt) atau `balanceOf` on-chain, dan keduanya dipakai apa adanya
 4 regression test baru di `scripts/smoke-executor.js` (total 26), masing-masing
 menyertakan **assert kontrol** yang membuktikan jalur lama memang rusak untuk
 nilai yang sama.
+
+---
+
+## 12. Semua temuan tersisa diselesaikan
+
+### K-3 — race `max_open_positions`
+
+Empat sumber sinyal bisa masuk ke pipeline bersamaan. Gate jumlah posisi dan
+INSERT dipisahkan banyak `await`, sehingga dua kandidat dapat sama-sama lolos.
+Seluruh pipeline kini diserialisasi FIFO dengan mutex (`src/lib/mutex.js`).
+Mutex tetap hidup bila pemegang sebelumnya melempar.
+
+### K-4 — dependency rentan
+
+`node-telegram-bot-api` dinaikkan dari 0.66.0 ke 1.1.0. Versi ini tetap
+mempertahankan API class yang digunakan aplikasi tetapi menghapus rantai legacy
+`request`/`form-data`. Hasil: `npm audit` turun dari 9 (2 critical) menjadi 0.
+
+### M-1 — otorisasi Telegram
+
+`TELEGRAM_ALLOWED_USER_IDS` menambah allowlist user di atas pemeriksaan chat.
+Message dan callback query keduanya diperiksa. Ini mencegah anggota lain dalam
+grup menjalankan `/mode live`, `/confirm`, `/close`, atau perubahan strategi.
+
+### M-2 — harga ETH hardcode
+
+Konstanta `$2500` di estimasi posisi dihapus. Poller harga WETH DexScreener
+dengan cache/staleness digunakan; fallback dapat dikonfigurasi melalui
+`ETH_USD_FALLBACK`. Nilai receipt/output on-chain tetap menjadi sumber utama.
+
+### M-3 — PnL mengabaikan gas dan partial proceeds
+
+Receipt V4/V3 sekarang mengembalikan `gasCostWei`; posisi mengakumulasi biaya
+gas entry, partial TP, dan exit. PnL live menjadi:
+
+```
+hasil exit + hasil partial TP − modal − seluruh gas
+```
+
+Ditemukan dan ditutup juga bug turunan: hasil ETH dari partial TP sebelumnya
+tidak pernah masuk PnL final.
+
+### M-4 sampai M-7 dan minor hardening
+
+- GitHub Actions menjalankan Node 22, `npm ci`, QC penuh, dan audit security.
+- `engines.node >=22.5.0` ditambahkan karena `node:sqlite`.
+- BOM/CRLF dan mojibake pada smoke script dinormalisasi.
+- Seluruh variabel environment yang dibaca kode kini tercantum di
+  `.env.example`.
+- Token name/symbol/security finding yang attacker-controlled dinormalisasi dan
+  dibatasi panjang sebelum masuk prompt; system prompt secara eksplisit
+  memperlakukannya sebagai data tak dipercaya.
+- Default global `llm_min_confidence` dan `max_open_positions` disamakan dengan
+  fallback runtime.
+- Nama peninggalan `executeJupiterSwap` diganti `executeSwap`, dan prompt
+  learning tidak lagi menyebut agen Solana.
+- 6 regression tests hardening ditambahkan (`scripts/smoke-hardening.js`).

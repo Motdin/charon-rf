@@ -203,6 +203,10 @@ export function initDb() {
   ensureColumn('dry_run_positions', 'execution_mode', "TEXT DEFAULT 'dry_run'");
   ensureColumn('dry_run_positions', 'strategy_id', "TEXT DEFAULT 'sniper'");
   ensureColumn('dry_run_positions', 'partial_tp_done', 'INTEGER DEFAULT 0');
+  // Gas kumulatif (entry + exit) dalam ETH — PnL yang mengabaikannya
+  // optimistis secara sistematis.
+  ensureColumn('dry_run_positions', 'gas_eth', 'REAL DEFAULT 0');
+  ensureColumn('dry_run_positions', 'realized_proceeds_eth', 'REAL DEFAULT 0');
 
   seedDefaults();
 }
@@ -214,8 +218,8 @@ function seedDefaults() {
     trading_mode: process.env.TRADING_MODE || 'dry_run',
     llm_candidate_pick_count: process.env.LLM_CANDIDATE_PICK_COUNT || '10',
     llm_candidate_max_age_ms: process.env.LLM_CANDIDATE_MAX_AGE_MS || '600000',
-    llm_min_confidence: process.env.LLM_MIN_CONFIDENCE || '60',
-    max_open_positions: process.env.MAX_OPEN_POSITIONS || '10',
+    llm_min_confidence: process.env.LLM_MIN_CONFIDENCE || '50',
+    max_open_positions: process.env.MAX_OPEN_POSITIONS || '3',
     default_tp_percent: '50',
     default_sl_percent: '-25',
     default_trailing_enabled: 'true',

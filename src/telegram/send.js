@@ -1,4 +1,4 @@
-import { TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, APP_NAME, GMGN_ENABLED, GMGN_API_KEY } from '../config.js';
+import { TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_ALLOWED_USER_IDS, APP_NAME, GMGN_ENABLED, GMGN_API_KEY } from '../config.js';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { existsSync, mkdirSync, unlinkSync } from 'node:fs';
@@ -47,6 +47,19 @@ import {
 
 let bot = null;
 let sendImpl = null;
+
+/**
+ * Otorisasi dua lapis: chat yang benar DAN (bila di-allowlist) user yang benar.
+ *
+ * Cek chat.id saja tidak cukup untuk TELEGRAM_CHAT_ID yang menunjuk grup —
+ * setiap anggota grup akan bisa memanggil /mode live, /confirm, /close.
+ * Kosongkan TELEGRAM_ALLOWED_USER_IDS untuk mempertahankan perilaku lama.
+ */
+export function isAuthorized({ chatId, userId }) {
+  if (String(chatId) !== String(TELEGRAM_CHAT_ID)) return false;
+  if (!TELEGRAM_ALLOWED_USER_IDS.length) return true;
+  return TELEGRAM_ALLOWED_USER_IDS.includes(String(userId));
+}
 
 export function getBot() {
   return bot;
@@ -382,7 +395,12 @@ export function startTelegramBot() {
     bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
 
     bot.on('message', async (msg) => {
-      if (String(msg.chat.id) !== String(TELEGRAM_CHAT_ID)) return;
+      if (!isAuthorized({ chatId: msg.chat?.id, userId: msg.from?.id })) {
+        if (String(msg.chat?.id) === String(TELEGRAM_CHAT_ID)) {
+          console.log(`[tg] perintah ditolak dari user ${msg.from?.id} (tidak di TELEGRAM_ALLOWED_USER_IDS)`);
+        }
+        return;
+      }
       const text = (msg.text || '').trim();
       if (!text) return;
 
@@ -827,7 +845,14 @@ export function startTelegramBot() {
     });
 
     bot.on('callback_query', async (query) => {
-      if (String(query.message?.chat?.id) !== String(TELEGRAM_CHAT_ID)) return;
+      if (!isAuthorized({ chatId: query.message?.chat?.id, userId: query.from?.id })) {
+        try {
+          await bot.answerCallbackQuery(query.id, { text: 'Tidak diizinkan.', show_alert: true });
+        } catch {
+          /* ignore */
+        }
+        return;
+      }
       const data = query.data || '';
       const chatId = query.message.chat.id;
       try {
