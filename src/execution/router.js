@@ -163,8 +163,11 @@ export async function executeConfirmedIntent(chatId, intentId, bot) {
 
     return sendPositionOpen(positionId);
   } catch (err) {
-    updateIntentStatus(intentId, 'execution_failed');
-    return bot.sendMessage(chatId, `Live execution failed: ${escapeHtml(err.message)}`, { parse_mode: 'HTML' });
+    updateIntentStatus(intentId, err.broadcast ? 'execution_failed_broadcast' : 'execution_failed');
+    const head = err.broadcast
+      ? `🚨 <b>DANA SUDAH KELUAR — posisi TIDAK tercatat</b>\nTx: <code>${escapeHtml(err.txHash || '?')}</code>\n⚠️ Token ada di wallet tanpa TP/SL.\n\n`
+      : '';
+    return bot.sendMessage(chatId, `${head}Live execution failed: ${escapeHtml(err.message)}`, { parse_mode: 'HTML' });
   }
 }
 

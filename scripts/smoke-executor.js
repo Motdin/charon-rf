@@ -10,6 +10,7 @@
  * Jika test ini lulus, encoding kita kompatibel persis dengan router on-chain.
  */
 import { strict as assert } from 'node:assert';
+import { readFileSync } from 'node:fs';
 import { decodeFunctionData } from 'viem';
 import {
   buildV4SwapInput,
@@ -297,6 +298,43 @@ await okAsync('getLogsChunked: error non-limit dilempar ulang', async () => {
     threw = /network unreachable/.test(String(err.message));
   }
   assert.equal(threw, true);
+});
+
+// ─── Regresi: setiap pengiriman transaksi WAJIB di-await ─────────────────────
+// Insiden nyata: `const hash = walletClient.writeContract(...)` tanpa await →
+// tx TETAP tersiar (dompet menunjukkan pembelian) tapi `hash` adalah Promise,
+// waitForTransactionReceipt menunggu "[object Promise]" sampai timeout 180 s,
+// lalu melempar. Hasilnya: dana keluar, posisi tidak pernah tercatat, tidak ada
+// TP/SL, dan wrap ikut di-rollback keliru.
+ok('setiap writeContract/sendTransaction di-await (regresi tx-hilang)', () => {
+  const src = readFileSync(new URL('../src/liveExecutor.js', import.meta.url), 'utf8');
+  const offenders = src
+    .split('\n')
+    .map((line, i) => ({ line: line.trim(), no: i + 1 }))
+    .filter(
+      ({ line }) =>
+        /\b(writeContract|sendTransaction)\s*\(/.test(line) &&
+        !/simulateContract/.test(line) &&
+        !/\bawait\b/.test(line) &&
+        !line.startsWith('*') &&
+        !line.startsWith('//')
+    );
+  assert.equal(
+    offenders.length,
+    0,
+    `pengiriman tx tanpa await di liveExecutor.js: ${offenders.map((o) => `baris ${o.no}`).join(', ')}`
+  );
+});
+
+ok('kegagalan setelah tx tersiar tidak me-rollback wrap', () => {
+  const src = readFileSync(new URL('../src/liveExecutor.js', import.meta.url), 'utf8');
+  // Kedua venue harus lewat finalizeSwapFailure, bukan rollbackWrap langsung.
+  assert.equal(
+    (src.match(/throw await finalizeSwapFailure\(/g) || []).length,
+    2,
+    'executeSwapV4 dan executeSwapV3 harus memakai finalizeSwapFailure'
+  );
+  assert.ok(/err\.broadcast = true/.test(src), 'error harus ditandai broadcast agar bisa direkonsiliasi');
 });
 
 console.log(`\n✓ smoke-executor PASSED (${passed} tests)`);

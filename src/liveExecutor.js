@@ -326,6 +326,29 @@ async function ensureWethCoverage(amountWei, reserveWei) {
   return { wrapped: deficit, wethBalance: wethBal + deficit };
 }
 
+/**
+ * Penanganan kegagalan swap yang sadar "sudah tersiar atau belum".
+ *
+ * Aturan emas: begitu transaksi TERSIAR (punya hash), dana sudah bergerak.
+ *   - JANGAN rollback wrap — WETH-nya kemungkinan sudah dipakai swap.
+ *   - Tandai error dengan txHash supaya lapisan atas bisa memberi tahu user
+ *     bahwa dana keluar meski posisi gagal tercatat (butuh rekonsiliasi manual).
+ * Kalau belum tersiar, barulah rollback wrap seperti semula.
+ */
+async function finalizeSwapFailure(err, { wrapped, broadcastHash, venue }) {
+  if (!broadcastHash) {
+    await rollbackWrap(wrapped);
+    return err;
+  }
+  err.txHash = broadcastHash;
+  err.broadcast = true;
+  err.message =
+    `${venue} swap TERSIAR (tx ${broadcastHash}) tapi konfirmasi/pembukuan gagal: ${err.message}. ` +
+    `DANA SUDAH BERGERAK — wrap tidak di-rollback; cek wallet & rekonsiliasi posisi manual.`;
+  console.log(`[live] ⚠️ ${err.message}`);
+  return err;
+}
+
 /** Rollback: kembalikan WETH yang baru di-wrap ke native ETH. Best-effort. */
 async function rollbackWrap(wrappedWei) {
   if (!LIVE_UNWRAP_ON_FAIL || BigInt(wrappedWei) <= 0n) return;
@@ -641,6 +664,7 @@ async function executeSwapV4({ poolKey, amountIn, isNativeIn, memeToken, deadlin
   });
 
   let wrapped = 0n;
+  let broadcastHash = null;
   try {
     // 2) Side effect HANYA setelah quote valid: wrap deficit + approval.
     if (isNativeIn && currencyIn === weth) {
@@ -680,7 +704,13 @@ async function executeSwapV4({ poolKey, amountIn, isNativeIn, memeToken, deadlin
       ? 0n
       : await fetchLiveTokenBalance(memeToken);
 
-    const hash = walletClient.writeContract({ ...request, account });
+    // ⚠️ WAJIB await — tanpa ini `hash` adalah Promise, transaksi tetap TERSIAR
+    // tapi waitForTransactionReceipt menunggu hash "[object Promise]" sampai
+    // timeout 180 s lalu melempar. Akibatnya: dana keluar, posisi TIDAK pernah
+    // tercatat, tidak ada TP/SL, dan wrap ikut di-rollback keliru.
+    const hash = await walletClient.writeContract({ ...request, account });
+    // Sejak titik ini dana SUDAH bergerak on-chain.
+    broadcastHash = hash;
     const receipt = await publicClient.waitForTransactionReceipt({ hash });
 
     let received;
@@ -706,8 +736,7 @@ async function executeSwapV4({ poolKey, amountIn, isNativeIn, memeToken, deadlin
       status: receipt.status,
     };
   } catch (err) {
-    await rollbackWrap(wrapped);
-    throw err;
+    throw await finalizeSwapFailure(err, { wrapped, broadcastHash, venue: 'V4' });
   }
 }
 
@@ -725,6 +754,7 @@ async function executeSwapV3({ route, amountIn, isNativeIn, memeToken, deadline 
   const tokenOut = isNativeIn ? normalizeAddress(memeToken) : weth;
 
   let wrapped = 0n;
+  let broadcastHash = null;
   try {
     if (isNativeIn) {
       const cov = await ensureWethCoverage(amountInBI, parseEther(String(LIVE_MIN_ETH_RESERVE)));
@@ -777,7 +807,10 @@ async function executeSwapV3({ route, amountIn, isNativeIn, memeToken, deadline 
     const beforeToken = isNativeIn ? await fetchLiveTokenBalance(memeToken) : 0n;
     const beforeWeth = !isNativeIn ? await wethBalance(account.address) : 0n;
 
-    const hash = walletClient.writeContract({ ...request, account });
+    // ⚠️ WAJIB await — lihat catatan identik di executeSwapV4.
+    const hash = await walletClient.writeContract({ ...request, account });
+    // Sejak titik ini dana SUDAH bergerak on-chain.
+    broadcastHash = hash;
     const receipt = await publicClient.waitForTransactionReceipt({ hash });
 
     let received;
@@ -813,8 +846,7 @@ async function executeSwapV3({ route, amountIn, isNativeIn, memeToken, deadline 
       status: receipt.status,
     };
   } catch (err) {
-    await rollbackWrap(wrapped);
-    throw err;
+    throw await finalizeSwapFailure(err, { wrapped, broadcastHash, venue: 'V3' });
   }
 }
 
