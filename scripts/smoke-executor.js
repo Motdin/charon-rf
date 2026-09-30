@@ -11,7 +11,13 @@
  */
 import { strict as assert } from 'node:assert';
 import { decodeFunctionData } from 'viem';
-import { buildV4SwapInput, poolIdFromKey, UNIVERSAL_ROUTER_ABI } from '../src/execution/v4.js';
+import {
+  buildV4SwapInput,
+  classifyV4Failure,
+  pickMostLiquidPool,
+  poolIdFromKey,
+  UNIVERSAL_ROUTER_ABI,
+} from '../src/execution/v4.js';
 import {
   isNativeSentinel,
   looksLikeV4PoolId,
@@ -24,6 +30,11 @@ import {
 let passed = 0;
 function ok(name, fn) {
   fn();
+  passed++;
+  console.log(`  ✓ ${name}`);
+}
+async function okAsync(name, fn) {
+  await fn();
   passed++;
   console.log(`  ✓ ${name}`);
 }
@@ -158,6 +169,54 @@ ok('reserveVerdict — WETH ikut dihitung, reserve tetap native', () => {
     reserveWei: eth(0.0005),
   });
   assert.equal(v.sufficient, true);
+});
+
+await okAsync('pickMostLiquidPool: pool zero-liquidity DITOLAK (regresi insiden 0x9e7a…c86)', async () => {
+  // Regresi nyata: pool kembar (ETH,token,10000,200) tanpa likuiditas menang
+  // seleksi karena sentinel -1n, lalu quoter revert UnexpectedRevertBytes.
+  const pools = [
+    { poolId: '0xaaaa', poolKey: { currency0: '0x' + '0'.repeat(40), currency1: '0x' + '1'.repeat(40), fee: 10000, tickSpacing: 200, hooks: '0x' + '0'.repeat(40) } },
+    { poolId: '0xbbbb', poolKey: { currency0: '0x' + '0'.repeat(40), currency1: '0x' + '1'.repeat(40), fee: 3000, tickSpacing: 60, hooks: '0x' + '0'.repeat(40) } },
+  ];
+  const liqById = { '0xaaaa': 0n, '0xbbbb': 42n };
+  const fakeClient = {
+    async readContract({ args }) {
+      return liqById[args[0]];
+    },
+  };
+  const best = await pickMostLiquidPool(fakeClient, '0x' + '2'.repeat(40), pools);
+  assert.equal(best.poolId, '0xbbbb', 'pool ber-liq harus menang');
+});
+
+await okAsync('pickMostLiquidPool: semua zero/rusak → null (bukan pool hantu)', async () => {
+  const pools = [
+    { poolId: '0xaaaa', poolKey: {} },
+    { poolId: '0xcccc', poolKey: {} },
+  ];
+  const fakeClient = {
+    async readContract({ args }) {
+      if (args[0] === '0xcccc') throw new Error('rpc gagal');
+      return 0n;
+    },
+  };
+  const best = await pickMostLiquidPool(fakeClient, '0x' + '2'.repeat(40), pools);
+  assert.equal(best, null, 'tanpa pool ber-liq, hasil harus null');
+});
+
+ok('classifyV4Failure: selector → dikenali, empty revert → gate hint', () => {
+  let cls = classifyV4Failure(new Error('The contract function "quoteExactInputSingle" reverted with the following signature:\n0x6190b2b0'));
+  assert.equal(cls.raw, 'selector');
+  assert.match(cls.summary, /UnexpectedRevertBytes/);
+
+  cls = classifyV4Failure(new Error('The contract function "execute" reverted.\nDetails: execution reverted'));
+  assert.equal(cls.raw, 'empty');
+  assert.match(cls.summary, /tanpa reason/);
+
+  cls = classifyV4Failure(new Error('The contract function reverted with signature 0x486aa307'));
+  assert.match(cls.summary, /PoolNotInitialized/);
+
+  cls = classifyV4Failure(new Error('some random rpc timeout'));
+  assert.equal(cls.raw, 'unknown');
 });
 
 console.log(`\n✓ smoke-executor PASSED (${passed} tests)`);
