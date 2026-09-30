@@ -1,6 +1,6 @@
 # Charon-RH
 
-Charon-style trench agent for **meme tokens on Robinhood Chain** (EVM L2, chainId **4663**).
+A Charon-style trench agent for **meme tokens on Robinhood Chain** (EVM L2, chainId **4663**).
 
 Adapted from [yunus-0x/charon](https://github.com/yunus-0x/charon) (Solana / Pump.fun) to EVM:
 
@@ -10,7 +10,7 @@ Adapted from [yunus-0x/charon](https://github.com/yunus-0x/charon) (Solana / Pum
 | Graduated tokens | New Uniswap pools / fresh pairs |
 | Trending feed | DexScreener trending/search |
 | GMGN enrichment | Blockscout holders + concentration |
-| Jupiter Ultra | Uniswap V3 SwapRouter02 |
+| Jupiter Ultra | Uniswap V4 (native-ETH pools) / V3 routing |
 | SOL reserve | ETH reserve |
 | SQLite + Telegram | SQLite + Telegram (same UX) |
 
@@ -18,7 +18,7 @@ Adapted from [yunus-0x/charon](https://github.com/yunus-0x/charon) (Solana / Pum
 
 ---
 
-## Flow
+## How it works
 
 ```mermaid
 flowchart TD
@@ -32,7 +32,7 @@ flowchart TD
     H --> I{Mode}
     I -->|dry_run| J[Simulate position]
     I -->|confirm| K[Telegram approve]
-    I -->|live| L[Uniswap swap]
+    I -->|live| L[Uniswap swap V4/V3]
     J & K & L --> M[TP / SL / Trailing / Partial / MaxHold]
 ```
 
@@ -45,9 +45,9 @@ flowchart TD
 | `smart_money` | immediate | holders ≥200, top10 ≤45%, partial TP | +100% / −25% partial 50%@100% | on |
 | `degen` | immediate | loose, rule-based | +30% / −15% trailing 10% | **off** |
 
-Activate: Telegram `/strategy <id>` or `/menu`.
+Activate one from Telegram with `/strategy <id>` or `/menu`.
 
-## Install
+## Getting started
 
 ```bash
 cd charon-rh
@@ -57,7 +57,7 @@ cp .env.example .env
 npm start
 ```
 
-### Required env
+### Required
 
 ```
 TELEGRAM_BOT_TOKEN=
@@ -83,12 +83,13 @@ LIVE_MIN_ETH_RESERVE=0.005
 SLIPPAGE_BPS=300
 ```
 
-> ⚠️ **Kontrak Uniswap — jangan pakai alamat canonical mainnet.** Alamat
-> SwapRouter02 `0x68b3…45fc` (default lama) dan factory `0x3312…fdfd` adalah alamat
-> *Ethereum mainnet* — di Robinhood Chain alamat itu **bukan kontrak** (EOA mati).
-> Default repo sekarang sudah alamat RH Chain yang terverifikasi, dan bot menolak
-> start di mode `live`/`confirm` jika ada kontrak router tanpa bytecode
-> (preflight saat boot). Detail & routing: lihat [Live execution routing](#live-execution-routing-v4v3).
+> ⚠️ **Uniswap contracts — never use canonical mainnet addresses here.** The old
+> SwapRouter02 `0x68b3…45fc` and factory `0x3312…fdfd` defaults were *Ethereum
+> mainnet* addresses — on Robinhood Chain those addresses are **not contracts**
+> (dead EOAs). The repo defaults now point at the verified Robinhood Chain
+> deployments, and the bot refuses to boot in `live`/`confirm` mode if any router
+> contract has no bytecode (boot-time preflight). Details:
+> [Live execution routing](#live-execution-routing-v4v3).
 
 ---
 
@@ -130,19 +131,19 @@ Inline keyboard flow:
 
 1. `/menu` → **Strategy**
 2. Pick `sniper` / `dip_buy` / `smart_money` / `degen`
-3. See current card + quick-edit buttons (TP, SL, trailing, size, max pos, LLM conf…)
-4. **Activate** or tap a field to edit
+3. See the current card + quick-edit buttons (TP, SL, trailing, size, max pos, LLM conf…)
+4. **Activate**, or tap a field to edit it
 
-**Interactive edit** (no typing `/stratset` needed):
+**Interactive editing** (no `/stratset` typing needed):
 
-- Tap a numeric/enum field → bot prompts → type the new value → saved immediately
+- Tap a numeric/enum field → the bot prompts → type the new value → saved immediately
 - Tap a bool field → toggles instantly (on/off)
-- `/cancel` aborts a pending prompt (TTL 3 minutes)
+- `/cancel` aborts a pending prompt (3-minute TTL)
 
 `/stratset <id> <key> <value>` still works for the full key list (26 fields).
 
-All edits write to SQLite `strategies.config_json` and are **hot-read** by
-`activeStrategy()` — next candidate uses the new values immediately.
+Every edit is written to the SQLite `strategies.config_json` row and is **hot-read** by
+`activeStrategy()` — the next candidate uses the new values immediately.
 
 ---
 
@@ -160,7 +161,7 @@ Bot:  Charon-RH status
       GMGN: off → DexScreener + Blockscout
 ```
 
-### 2. Browse menu → edit a strategy interactively
+### 2. Browse the menu → edit a strategy interactively
 
 ```
 You:  /menu
@@ -206,14 +207,14 @@ Bot:  ✅ sniper → tp_percent = 75 (was 50)
 ### 3. Bool toggle (instant, no typing)
 
 ```
-You:  (tap "Trailing %: 20" area → actually tap a bool field)
+You:  (tap a bool field)
 Bot:  ▶️ sniper — Sniper
         ...
         TP 75% / SL -25% · Trail 20% (off)   ← toggled
       ...
 ```
 
-Or use the command form:
+Or the command form:
 
 ```
 You:  /stratset sniper trailing_enabled false
@@ -252,7 +253,7 @@ Bot:  🟢 Position opened
       Entry: $48.2k mcap · Size: 0.0500 ETH
       PnL: +0.0%
 
-      … (monitor every 10s) …
+      … (monitored every 10s) …
 
 Bot:  ✅ Position closed TRAILING_TP
       FUSU #3
@@ -323,7 +324,7 @@ Bot:  Open positions
 ```
 You:  (tapped a field, prompt is open)
 You:  /cancel
-Bot:  Edit dibatalkan.
+Bot:  Edit cancelled.
 ```
 
 ### 9. Daily PnL card for X / Twitter
@@ -339,7 +340,7 @@ Bot:  (sends a 1200×675 PNG)
       Best: FUSU `+61.4%`
       Worst: AGQLX `-25.0%`
 
-      Siap diunggah ke X.
+      Ready to post on X.
 
 You:  /pnlcard text
 Bot:  📋 PnL text card — 2026-09-26
@@ -350,12 +351,12 @@ Bot:  (PNG for that specific date)
 ```
 
 The card is generated by `scripts/render_pnl_card.py` (Pillow) from
-`dry_run_positions` closed trades for that UTC day. Covers:
+`dry_run_positions` closed trades for that UTC day. It covers:
 
 - Net PnL % + ETH
 - Win rate (W/L)
-- Trades · Open positions
-- Best / Worst ticker
+- Trades · open positions
+- Best / worst ticker
 - Cumulative PnL sparkline
 - Strategy + execution mode
 - `not financial advice` footer for X compliance
@@ -373,6 +374,21 @@ The card is generated by `scripts/render_pnl_card.py` (Pillow) from
 | 5 | **Smart money** | saved wallets + sniper/insider | Blockscout holders + transfers |
 | 6 | **Pons launchpad** | launch/graduation feed, fixed-supply tokens | free / public |
 
+When GMGN is disabled, out of weight, rate-limited, or erroring, the pipeline
+**automatically falls back** to DexScreener + Blockscout — same candidate shape,
+no crash, no stall.
+
+```env
+GMGN_ENABLED=true
+GMGN_API_KEY=gmgn_xxx
+GMGN_CHAIN=robinhood
+GMGN_WEIGHT_BUDGET=5          # free tier
+GMGN_WEIGHT_WINDOW_MS=60000   # reset window
+GMGN_REQUEST_DELAY_MS=2500    # 1 req / 5s max (official rule)
+```
+
+Check the current budget from Telegram `/status` or the boot logs.
+
 ### Pons launchpad signal
 
 [Pons](https://www.ponsfamily.com/launchpad) is the Robinhood Chain launchpad:
@@ -388,12 +404,11 @@ fixed **1B supply**, WETH pool with **LP locked at creation**, graduation thresh
 - Factory v2: `0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e`
 - Docs: https://docs.ponsfamily.com/llms.txt
 
-Each fresh launch / graduation becomes a candidate with signal label `pons`
-(plus `graduated` when complete) — this is the Charon equivalent of Pump.fun
+Each fresh launch / graduation becomes a candidate with the signal label `pons`
+(plus `graduated` when complete) — the Charon equivalent of the Pump.fun
 `fee-claim` + `graduated` overlap.
 
-Env:
-```
+```env
 PONS_ENABLED=true
 PONS_POLL_MS=30000
 PONS_LOOKBACK_MS=1800000
@@ -423,59 +438,7 @@ Strategy gates: `require_security_pass`, `max_security_risk`.
 Optional external APIs (best-effort, may not cover chain 4663):
 `fetchGoPlusSecurity`, `fetchHoneypotIs` in `src/enrichment/security.js`.
 
-When GMGN is disabled, out of weight, rate-limited, or errors, the pipeline
-**automatically falls back** to DexScreener + Blockscout — same candidate shape,
-no crash, no stall.
-
-```env
-GMGN_ENABLED=true
-GMGN_API_KEY=gmgn_xxx
-GMGN_CHAIN=robinhood
-GMGN_WEIGHT_BUDGET=5          # free tier
-GMGN_WEIGHT_WINDOW_MS=60000   # reset window
-GMGN_REQUEST_DELAY_MS=2500    # 1 req / 5s max (official rule)
-```
-
-Check current budget from Telegram `/status` or logs at boot.
-
-## Learning loop (LLM)
-
-Charon-RH can learn from its own closed trades and feed lessons back into
-future buy decisions.
-
-```mermaid
-flowchart LR
-    A[Closed trades] --> B["/learn 24h"]
-    B --> C[LLM extracts lessons]
-    C --> D[learning_lessons table]
-    D --> E[injected into next LLM prompt]
-    E --> F[better BUY / WATCH / PASS]
-    F --> A
-```
-
-| Command | What it does |
-|---|---|
-| `/learn 24h` | Analyze last 24h closed trades with LLM → store 1–5 lessons |
-| `/learn 1h` / `6h` / `7d` | Other windows |
-| `/lessons` | Show active lessons with evidence |
-| `/lessondel <id>` | Remove a lesson |
-
-Example lesson:
-
-```
-🔴 SL exits hit avg -28% vs target -15% — widen SL or check price source
-   [5/8 SL, avg loss -28%]
-```
-
-- **LLM** (OpenAI-compatible: `LLM_BASE_URL` / `LLM_MODEL`) returns strict JSON
-  `{lessons:[{lesson, evidence, severity}]}`
-- **Fallback** if LLM is off or fails: rule-based lessons from stats
-  (win rate, SL ratio, avg loss, net PnL)
-- Stored lessons are injected as `recent_lessons` on every LLM batch decision
-  (`src/pipeline/llm.js` → `activeLessonsForPrompt`)
-- Table: `learning_lessons` in SQLite
-
-Typical cadence: run `/learn 24h` once a day after a dry-run session.
+---
 
 ## Overlap signals (the Charon idea)
 
@@ -489,46 +452,40 @@ A candidate is stronger when **multiple sources agree**:
    (LP locked at creation, fixed 1B supply, graduation threshold)
 
 Strategies set `min_source_count` (sniper/smart_money require ≥2). This replaces
-Pump.fun fee-claim overlap with EVM-native evidence of real economic activity.
+the Pump.fun fee-claim overlap with EVM-native evidence of real economic activity.
 
-Pons launch API (public, no key):
-
-```
-GET https://www.ponsfamily.com/api/pons-launches?limit=100
-GET https://www.ponsfamily.com/api/pons-token/{token}
-GET https://www.ponsfamily.com/api/pons-market/{token}
-```
-
-Factory (v1): `0xA5aAb3F0c6EeadF30Ef1D3Eb997108E976351feB`
-Factory (v2): `0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e`
+---
 
 ## Live execution routing (V4/V3)
 
-Eksekutor live memilih venue secara otomatis per token (`src/liveExecutor.js` → `resolveSwapRoute`):
+The live executor picks the right venue per token automatically
+(`src/liveExecutor.js` → `resolveSwapRoute`):
 
-| Venue | Kapan dipakai | Kontrak RH Chain (terverifikasi) |
+| Venue | When it's used | Robinhood Chain contracts (verified) |
 |---|---|---|
-| **Uniswap V4** (utama) | Pool meme ber-quote **ETH native** — mayoritas meme RH (labels `v4` di DexScreener, `pairAddress` = poolId 32-byte) | UniversalRouter `0x8876789976dEcBfCbBbe364623C63652db8C0904` · PoolManager `0x8366a39CC670B4001A1121B8F6A443A643e40951` · Quoter `0x8Dc178eFB8111BB0973Dd9d722ebeFF267c98F94` · StateView `0xF3334192D15450CdD385c8B70e03f9a6bD9E673b` |
-| **Uniswap V3** | Pool WETH–token ada di factory V3 | SwapRouter02 `0xCaf681a66D020601342297493863E78C959E5cb2` · Factory `0x1f7d7550B1b028f7571E69A784071F0205FD2EfA` |
+| **Uniswap V4** (primary) | Meme pools quoted in **native ETH** — the standard for RH memes (`v4` label on DexScreener; `pairAddress` = 32-byte poolId) | UniversalRouter `0x8876789976dEcBfCbBbe364623C63652db8C0904` · PoolManager `0x8366a39CC670B4001A1121B8F6A443A643e40951` · Quoter `0x8Dc178eFB8111BB0973Dd9d722ebeFF267c98F94` · StateView `0xF3334192D15450CdD385c8B70e03f9a6bD9E673b` |
+| **Uniswap V3** | A WETH–token pool exists on the V3 factory | SwapRouter02 `0xCaf681a66D020601342297493863E78C959E5cb2` · Factory `0x1f7d7550B1b028f7571E69A784071F0205FD2EfA` |
 
-Cara kerja:
+How routing works:
 
-1. **Route resolve**: DexScreener pair (`labels`) → cache SQLite `v4_pools` → scan factory V3 → scan log `Initialize` PoolManager V4 (fee/tickSpacing/hooks selalu dibaca dari log, tidak pernah ditebak).
-2. **V4**: buy dengan pool ETH-native tidak perlu wrap sama sekali (settle via `msg.value`); quote dari V4Quoter off-chain → `simulateContract` penuh → baru kirim tx. Sell ERC20 memakai jalur **Permit2** (`0x0000…BA3`). Encoding V4_SWAP diverifikasi **byte-identik** dengan tx sukses on-chain (golden test `scripts/smoke-executor.js`).
-3. **V3**: quote lewat simulasi, wrap **hanya selisih kekurangan** WETH, `amountOutMinimum` dari quote dengan `SLIPPAGE_BPS`.
-4. **Pengaman dana**:
-   - Preflight boot (`live`/`confirm`): semua kontrak router harus punya bytecode — kalau tidak, bot **berhenti** dengan pesan jelas.
-   - **Quote & simulasi mendahului** setiap transaksi bernilai.
-   - Reserve check menghitung ETH native **+ WETH**; reserve gas tetap native.
-   - Gagal total setelah wrap → **auto-unwrap rollback** (`LIVE_UNWRAP_ON_FAIL=true`).
-   - Pool/currency tak didukung (quote bukan ETH/WETH) → ditolak sebelum dana bergerak.
+1. **Route resolution**: DexScreener pair (`labels`) → SQLite `v4_pools` cache → V3 factory scan → V4 `Initialize` log scan on the PoolManager. Fee, tickSpacing and hooks are always read from on-chain logs — never guessed.
+2. **V4**: buying into a native-ETH pool needs no wrapping at all (settlement via `msg.value`); quotes come from the off-chain V4Quoter → full `simulateContract` → only then is a transaction sent. ERC20 sells go through **Permit2** (`0x0000…BA3`). The V4_SWAP calldata is verified **byte-identical** to a successful on-chain transaction (golden test in `scripts/smoke-executor.js`).
+3. **V3**: quote via simulation, wrap **only the WETH deficit**, `amountOutMinimum` derived from the quote with `SLIPPAGE_BPS`.
+4. **Fund-safety rails**:
+   - Boot-time preflight (`live`/`confirm`): every router contract must have bytecode — otherwise the bot **stops** with a clear error.
+   - **Quotes and simulation happen before** any value-bearing transaction.
+   - The reserve check counts native ETH **+ WETH**; the gas reserve must stay native.
+   - If a swap fails after wrapping → **automatic unwrap rollback** (`LIVE_UNWRAP_ON_FAIL=true`).
+   - Unsupported pools/currencies (quote asset other than ETH/WETH) → rejected before funds move.
 
-Utilitas:
+Utilities:
 
 ```bash
-node scripts/probe-route.js <mint> [amountEth]   # read-only: venue + poolKey + quote V4
-node scripts/revoke-weth.js [spender...]         # bersihkan approve WETH ke alamat mati
+node scripts/probe-route.js <mint> [amountEth]   # read-only: venue + poolKey + V4 quote
+node scripts/revoke-weth.js [spender...]         # clean WETH approvals to dead addresses
 ```
+
+---
 
 ## Risk controls
 
@@ -551,11 +508,50 @@ node scripts/revoke-weth.js [spender...]         # bersihkan approve WETH ke ala
 Shows the last 8 rejected candidates and the exact filter reasons — use this
 to tune `/stratset` instead of guessing.
 
+## Learning loop (LLM)
+
+Charon-RH can learn from its own closed trades and feed lessons back into
+future buy decisions.
+
+```mermaid
+flowchart LR
+    A[Closed trades] --> B["/learn 24h"]
+    B --> C[LLM extracts lessons]
+    C --> D[learning_lessons table]
+    D --> E[injected into next LLM prompt]
+    E --> F[better BUY / WATCH / PASS]
+    F --> A
+```
+
+| Command | What it does |
+|---|---|
+| `/learn 24h` | Analyze last 24h of closed trades with the LLM → store 1–5 lessons |
+| `/learn 1h` / `6h` / `7d` | Other windows |
+| `/lessons` | Show active lessons with evidence |
+| `/lessondel <id>` | Remove a lesson |
+
+Example lesson:
+
+```
+🔴 SL exits hit avg -28% vs target -15% — widen SL or check price source
+   [5/8 SL, avg loss -28%]
+```
+
+- The **LLM** (OpenAI-compatible: `LLM_BASE_URL` / `LLM_MODEL`) returns strict JSON
+  `{lessons:[{lesson, evidence, severity}]}`
+- **Fallback** when the LLM is off or fails: rule-based lessons from stats
+  (win rate, SL ratio, avg loss, net PnL)
+- Stored lessons are injected as `recent_lessons` into every LLM batch decision
+  (`src/pipeline/llm.js` → `activeLessonsForPrompt`)
+- Table: `learning_lessons` in SQLite
+
+Typical cadence: run `/learn 24h` once a day after a dry-run session.
+
 ## Storage
 
-`charon-rh.sqlite` holds candidates, LLM decisions/batches, positions, trades, intents, decision logs, signal events, price alerts, strategies.
+`charon-rh.sqlite` holds candidates, LLM decisions/batches, positions, trades, intents, decision logs, signal events, price alerts, strategies, and the V4 pool cache.
 
-Open positions resume monitoring after restart.
+Open positions resume monitoring after a restart.
 
 ## Project layout
 
@@ -573,14 +569,14 @@ charon-rh/
     execution/     router (buy/sell), positions (TP/SL, price-based PnL),
                    v4 (Universal Router/Quoter/poolKey), swapMath (pure helpers)
     telegram/      bot + menu + format
-    liveExecutor.js  viem + routing V4 (native ETH) / V3 (WETH) + fund-safety rails
+    liveExecutor.js  viem + V4 (native ETH) / V3 (WETH) routing + fund-safety rails
   scripts/         smoke suites, verify, probe-route, revoke-weth, render_pnl_card.py
 ```
 
 ## Verify
 
 ```bash
-npm run check    # syntax all modules
+npm run check    # syntax-check all modules
 npm run build    # full QC (syntax + all smoke suites)
 npm run verify   # same as build
 npm test         # alias verify
@@ -589,14 +585,14 @@ npm test         # alias verify
 ## Notes
 
 - Robinhood Chain public RPCs: `rpc.mainnet.chain.robinhood.com`, `robinhood-rpc.publicnode.com`, `robinhood.drpc.org`
-- Explorers: [robinscan.io](https://robinscan.io), [blockscout](https://robinhoodchain.blockscout.com)
-- DexScreener public API is rate-limited — polling intervals are intentionally conservative
-- Live swaps route otomatis ke Uniswap **V4** (pool meme ber-quote ETH native — jalur utama di chain ini) atau **V3** (pool WETH) — lihat [Live execution routing](#live-execution-routing-v4v3)
+- Explorers: [robinscan.io](https://robinscan.io), [Blockscout](https://robinhoodchain.blockscout.com)
+- The DexScreener public API is rate-limited — polling intervals are intentionally conservative
+- Live swaps route automatically to Uniswap **V4** (native-ETH meme pools — the primary venue on this chain) or **V3** (WETH pools) — see [Live execution routing](#live-execution-routing-v4v3)
 - Tokenized stocks on Robinhood Chain settle via USDG and are **out of scope** of this meme-trench agent
 
 ---
 
-## DONATIONS for project
+## Donations
 
 If this project helps you, consider supporting continued development.
 
