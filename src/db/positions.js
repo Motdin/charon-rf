@@ -1,6 +1,7 @@
 import { db } from './connection.js';
 import { now, json, parseJson } from '../utils.js';
 import { numSetting, setting, strategyById, activeStrategy } from './settings.js';
+import { toRawAmountString } from '../execution/swapMath.js';
 
 export function tradingMode() {
   return setting('trading_mode', process.env.TRADING_MODE || 'dry_run');
@@ -105,7 +106,7 @@ export function createDryRunPosition(candidateId, candidate, decision, source = 
     entryPrice,
     entryMcap,
     tokenAmountEst,
-    tokenAmountRaw: String(Math.floor(tokenAmountEst * 1e18)),
+    tokenAmountRaw: toRawAmountString(tokenAmountEst),
   });
 }
 
@@ -125,7 +126,9 @@ export function createLivePosition(candidateId, candidate, decision, swap, sourc
     entryPrice,
     entryMcap,
     tokenAmountEst,
-    tokenAmountRaw: String(swap.outputAmount || Math.floor(tokenAmountEst * 1e18)),
+    // outputAmount sudah raw uint256 dari receipt — pakai apa adanya.
+    // Fallback estimasi lewat helper agar tidak pernah jadi notasi eksponensial.
+    tokenAmountRaw: swap.outputAmount ? String(swap.outputAmount) : toRawAmountString(tokenAmountEst),
     entrySignature: swap.signature,
   });
 }

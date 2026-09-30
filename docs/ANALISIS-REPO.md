@@ -501,3 +501,61 @@ token rug tanpa peringatan hanya memberi rasa aman palsu.
 
 Suite baru `scripts/smoke-adopt.js` (16 assert) terdaftar di `npm run verify`,
 dengan fokus pada round-trip presisi uint256 dan integrasi ke `openPositions()`.
+
+---
+
+## 11. K-1 diselesaikan: presisi uint256 pada partial TP
+
+Dua cacat terpisah di blok Partial TP (`src/execution/positions.js`), keduanya
+bisa membuat sebagian posisi live tidak pernah terjual.
+
+### Cacat 1 — `Number()` pada uint256
+
+```js
+const sellAmount = Math.floor(Number(position.token_amount_raw) * (pct / 100));
+await executeLiveSell({ ...position, token_amount_raw: String(sellAmount) });
+```
+
+Saldo memecoin 18-desimal rutin melewati `2^53`, dan begitu nilainya ≥ 1e21
+`String(number)` berubah jadi notasi eksponensial. `executeLiveSell` memanggil
+`BigInt(String(amount))` → **TypeError**.
+
+```
+raw  5000000000000000000000000   (5 juta token @18 desimal)
+lama String(Math.floor(Number(raw)*0.5)) = "2.5e+24" → BigInt() melempar
+baru portionOfRawAmount(raw, 50)         = 2500000000000000000000000n ✓
+```
+
+### Cacat 2 — `markPartialTpDone()` dipanggil sebelum menjual
+
+Flag ditulis lebih dulu, jadi ketika jual gagal (karena Cacat 1 atau sebab
+lain) partial TP **hangus permanen** — tick berikutnya melihat
+`partial_tp_done = 1` dan tidak pernah mencoba lagi. Kegagalannya pun hanya
+satu baris `console.log`, tanpa notifikasi.
+
+### Perbaikan
+
+- Helper murni baru di `src/execution/swapMath.js`:
+  - `portionOfRawAmount(raw, percent)` — BigInt penuh, floor (tidak pernah
+    menjual lebih dari yang dimiliki), basis 1e6 agar persen pecahan akurat,
+    `>100%` dibatasi ke seluruh saldo.
+  - `toRawAmountString(amount, decimals)` — konversi estimasi float ke string
+    desimal yang **tidak pernah** eksponensial (lewat `BigInt(Number)`, bukan
+    `String(Number)`).
+- `markPartialTpDone()` dipindahkan ke **setelah** jual berhasil → kegagalan
+  otomatis dicoba lagi pada tick berikutnya.
+- Kegagalan partial TP kini dikirim ke Telegram, bukan hanya `console.log`.
+- Dua sumber eksponensial lain ikut ditutup:
+  `createDryRunPosition` dan fallback `createLivePosition` di
+  `src/db/positions.js` sekarang memakai `toRawAmountString()`.
+  Tidak ada lagi `String(Math.floor(...))` / `String(Number(...))` di `src/`.
+
+Catatan jujur soal `toRawAmountString`: inputnya float hasil estimasi, jadi
+presisi di luar ~17 digit signifikan memang hilang (drift relatif < 1e-12).
+Yang dijamin adalah hasilnya **selalu** string desimal valid untuk `BigInt()`.
+Nilai yang benar-benar presisi selalu datang dari `swap.outputAmount` (raw
+uint256 dari receipt) atau `balanceOf` on-chain, dan keduanya dipakai apa adanya.
+
+4 regression test baru di `scripts/smoke-executor.js` (total 26), masing-masing
+menyertakan **assert kontrol** yang membuktikan jalur lama memang rusak untuk
+nilai yang sama.

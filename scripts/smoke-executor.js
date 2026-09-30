@@ -28,6 +28,8 @@ import {
   minOutWithSlippage,
   wrapDeficit,
   reserveVerdict,
+  portionOfRawAmount,
+  toRawAmountString,
 } from '../src/execution/swapMath.js';
 
 let passed = 0;
@@ -394,6 +396,79 @@ ok('resolveSwapRoute melonggarkan gate likuiditas khusus untuk jual', () => {
     /resolveSwapRoute\(memeToken, dexPair, \{ allowZeroLiquidity: !isNativeIn \}\)/.test(src),
     'executeJupiterSwap harus meneruskan allowZeroLiquidity untuk sisi jual'
   );
+});
+
+// ─── Regresi K-1: presisi uint256 pada partial TP ────────────────────────────
+// Saldo memecoin 18-desimal rutin melewati 2^53 dan >= 1e21. Jalur lama
+// `Math.floor(Number(raw) * pct)` + `String()` menghasilkan "2.5e+24", yang
+// membuat BigInt() di executeLiveSell melempar → partial TP gagal diam-diam.
+ok('portionOfRawAmount: BigInt penuh, tanpa notasi eksponensial', () => {
+  const raw = '5000000000000000000000000'; // 5 juta token @18 desimal = 5e24
+
+  // Kontrol: jalur LAMA memang rusak untuk nilai ini.
+  const legacy = String(Math.floor(Number(raw) * 0.5));
+  assert.match(legacy, /e\+/i, 'kontrol: jalur lama menghasilkan eksponensial');
+  assert.throws(() => BigInt(legacy), 'kontrol: BigInt() melempar pada hasil lama');
+
+  // Jalur baru.
+  const half = portionOfRawAmount(raw, 50);
+  assert.equal(half, 2500000000000000000000000n, 'separuh tepat, tanpa kehilangan presisi');
+  assert.doesNotMatch(half.toString(), /e\+/i, 'tidak ada notasi eksponensial');
+  assert.equal(BigInt(half.toString()), half, 'bisa di-parse ulang oleh BigInt');
+});
+
+ok('portionOfRawAmount: floor, persen pecahan, dan batas aman', () => {
+  assert.equal(portionOfRawAmount('100', 12.5), 12n, 'persen pecahan akurat + floor');
+  assert.equal(portionOfRawAmount('7', 50), 3n, 'floor: jangan pernah jual lebih dari yang dimiliki');
+  assert.equal(portionOfRawAmount('1000', 100), 1000n, '100% = seluruhnya');
+  assert.equal(portionOfRawAmount('1000', 150), 1000n, '>100% dibatasi ke seluruhnya');
+  assert.equal(portionOfRawAmount('1000', 0), 0n, '0% = nol');
+  assert.equal(portionOfRawAmount('0', 50), 0n, 'saldo nol aman');
+
+  // Sisa + terjual harus selalu = total (tidak boleh ada token menguap).
+  const raw = 123456789012345678901234567n;
+  const sell = portionOfRawAmount(raw, 37);
+  assert.ok(sell + (raw - sell) === raw, 'sisa + terjual = total');
+});
+
+ok('toRawAmountString: estimasi besar tetap string desimal valid', () => {
+  // Kontraknya BUKAN presisi sempurna — inputnya float hasil estimasi, jadi
+  // kehilangan presisi di luar ~17 digit signifikan memang melekat. Yang
+  // dijamin: hasilnya SELALU string desimal yang bisa di-BigInt(), tidak
+  // pernah notasi eksponensial. Itulah yang dulu merusak jalur jual.
+  const out = toRawAmountString(5_000_000);
+  assert.doesNotMatch(out, /e\+/i, '5 juta token tidak jadi eksponensial');
+  assert.doesNotThrow(() => BigInt(out), 'selalu bisa di-parse BigInt');
+
+  // Akurat dalam toleransi float (relatif < 1e-12).
+  const got = BigInt(out);
+  const want = 5000000000000000000000000n;
+  const drift = got > want ? got - want : want - got;
+  assert.ok(drift * 1_000_000_000_000n < want, `drift float dapat diabaikan (${drift})`);
+
+  // Kontrol: jalur lama pada nilai yang sama memang menghasilkan eksponensial.
+  assert.match(String(Math.floor(5_000_000 * 1e18)), /e\+/i, 'kontrol: jalur lama rusak');
+
+  assert.equal(toRawAmountString(0), '0');
+  assert.equal(toRawAmountString(-5), '0', 'negatif ditolak');
+  assert.equal(toRawAmountString(Infinity), '0', 'Infinity ditolak');
+  assert.equal(toRawAmountString(NaN), '0', 'NaN ditolak');
+});
+
+ok('partial TP: markPartialTpDone hanya SETELAH jual berhasil', () => {
+  const src = readFileSync(new URL('../src/execution/positions.js', import.meta.url), 'utf8');
+  const block = src.slice(src.indexOf('// Partial TP'), src.indexOf('// Standard exits'));
+  const sellIdx = block.indexOf('await executeLiveSell');
+  const markIdx = block.indexOf('markPartialTpDone', sellIdx);
+  assert.ok(sellIdx > -1, 'blok partial TP harus memanggil executeLiveSell');
+  assert.ok(markIdx > sellIdx, 'markPartialTpDone harus SETELAH jual — kegagalan wajib bisa retry');
+  // Tidak boleh ada Number() pada token_amount_raw di blok ini.
+  assert.doesNotMatch(
+    block,
+    /Number\(\s*position\.token_amount_raw/,
+    'token_amount_raw tidak boleh lewat Number()'
+  );
+  assert.match(block, /portionOfRawAmount\(/, 'harus memakai helper BigInt');
 });
 
 console.log(`\n✓ smoke-executor PASSED (${passed} tests)`);

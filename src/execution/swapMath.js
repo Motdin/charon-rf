@@ -76,3 +76,40 @@ export function reserveVerdict({ nativeWei, wethWei, needWei, reserveWei }) {
     gasOk,
   };
 }
+
+/**
+ * Ambil `percent`% dari jumlah raw uint256, seluruhnya dalam BigInt.
+ *
+ * JANGAN pernah memakai Number() untuk ini. Saldo memecoin 18-desimal rutin
+ * melewati 2^53, dan begitu nilainya >= 1e21 `String(number)` berubah jadi
+ * notasi eksponensial ("2.5e+24") yang membuat BigInt() melempar di jalur jual.
+ * Itu bug nyata: partial TP gagal diam-diam dan tidak pernah dicoba ulang.
+ *
+ * Pembulatan ke bawah (floor) — jangan pernah mencoba menjual lebih dari yang dimiliki.
+ */
+export function portionOfRawAmount(rawAmount, percent) {
+  const raw = BigInt(rawAmount);
+  if (raw <= 0n) return 0n;
+  const pct = Number(percent);
+  if (!Number.isFinite(pct) || pct <= 0) return 0n;
+  if (pct >= 100) return raw;
+  // basis 1e6 agar persen pecahan (mis. 12,5%) tetap akurat
+  const scaled = BigInt(Math.round(pct * 10_000));
+  return (raw * scaled) / 1_000_000n;
+}
+
+/**
+ * Konversi jumlah token (float, hasil estimasi) ke string raw uint256.
+ *
+ * BigInt(Number) menerima Number integral berapa pun besarnya tanpa melewati
+ * String(), jadi bebas dari notasi eksponensial. Presisi float tetap terbatas —
+ * ini memang hanya estimasi — tapi hasilnya selalu string desimal yang valid
+ * untuk BigInt() di hilir.
+ */
+export function toRawAmountString(amount, decimals = 18) {
+  const n = Number(amount);
+  if (!Number.isFinite(n) || n <= 0) return '0';
+  const scaled = Math.round(n * 10 ** Number(decimals));
+  if (!Number.isFinite(scaled)) return '0';
+  return BigInt(scaled).toString();
+}

@@ -19,7 +19,8 @@ import { fetchDexPair, trending } from '../signals/dexscreener.js';
 import { executeLiveSell } from './router.js';
 import { fetchLiveTokenBalance, resolveSwapRoute } from '../liveExecutor.js';
 import { sendPositionExit, sendTelegram } from '../telegram/send.js';
-import { now, toNumber, firstPositiveNumber, fmtPct } from '../utils.js';
+import { now, toNumber, firstPositiveNumber, fmtPct, escapeHtml } from '../utils.js';
+import { portionOfRawAmount, toRawAmountString } from './swapMath.js';
 import { startBlockWatcher } from '../lib/blockWatcher.js';
 
 /**
@@ -82,15 +83,23 @@ export async function refreshPosition(position, { autoExit = true } = {}) {
 
   // Partial TP
   if (!exitReason && strat?.partial_tp && !position.partial_tp_done && pnlPercent >= strat.partial_tp_at_percent) {
-    markPartialTpDone(position.id);
     console.log(`[position] ${position.id} partial TP at ${pnlPercent.toFixed(1)}% (${strat.partial_tp_sell_percent}% sell)`);
     if (position.execution_mode === 'live' && position.token_amount_raw) {
       try {
-        const sellAmount = Math.floor(Number(position.token_amount_raw) * (strat.partial_tp_sell_percent / 100));
-        if (sellAmount > 0) {
-          const sell = await executeLiveSell({ ...position, token_amount_raw: String(sellAmount) }, 'PARTIAL_TP');
-          const remaining = Number(position.token_amount_raw) - sellAmount;
-          updateTokenAmount(position.id, remaining);
+        // Matematika BigInt penuh. Number() di sini dulunya merusak saldo
+        // >= 1e21 menjadi notasi eksponensial sehingga BigInt() di
+        // executeLiveSell melempar — partial TP gagal diam-diam.
+        const sellAmount = portionOfRawAmount(position.token_amount_raw, strat.partial_tp_sell_percent);
+        if (sellAmount > 0n) {
+          const sell = await executeLiveSell(
+            { ...position, token_amount_raw: sellAmount.toString() },
+            'PARTIAL_TP'
+          );
+          const remaining = BigInt(position.token_amount_raw) - sellAmount;
+          updateTokenAmount(position.id, remaining.toString());
+          // Baru DI SINI ditandai selesai — dulu ditandai sebelum jual, jadi
+          // satu kegagalan membuat partial TP hangus permanen tanpa retry.
+          markPartialTpDone(position.id);
           recordTrade({
             positionId: position.id,
             mint: position.mint,
@@ -98,15 +107,34 @@ export async function refreshPosition(position, { autoExit = true } = {}) {
             price,
             mcap,
             sizeEth: position.size_eth * (strat.partial_tp_sell_percent / 100),
-            tokenAmountEst: sellAmount,
+            tokenAmountEst: sellAmount.toString(),
             reason: 'PARTIAL_TP',
-            payload: { pnlPercent, sell, partialSellPercent: strat.partial_tp_sell_percent, remaining },
+            payload: {
+              pnlPercent,
+              sell,
+              partialSellPercent: strat.partial_tp_sell_percent,
+              remaining: remaining.toString(),
+            },
           });
+        } else {
+          // Tidak ada yang bisa dijual — tandai selesai agar tidak dicoba tiap tick.
+          markPartialTpDone(position.id);
         }
       } catch (err) {
-        console.log(`[position] ${position.id} partial sell failed: ${err.message}`);
+        // TIDAK ditandai selesai → tick berikutnya mencoba lagi.
+        console.log(`[position] ${position.id} partial sell gagal (akan dicoba lagi): ${err.message}`);
+        await sendTelegram(
+          [
+            `⚠️ <b>Partial TP gagal</b> — posisi #${position.id} ${escapeHtml(position.symbol || '')}`,
+            `PnL ${fmtPct(pnlPercent)} · target jual ${strat.partial_tp_sell_percent}%`,
+            `Error: ${escapeHtml(err.message)}`,
+            '',
+            'Posisi tetap terbuka dan akan dicoba lagi pada tick berikutnya.',
+          ].join('\n')
+        );
       }
     } else {
+      markPartialTpDone(position.id);
       // dry-run partial bookkeeping
       recordTrade({
         positionId: position.id,
