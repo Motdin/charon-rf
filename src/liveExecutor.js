@@ -1,6 +1,5 @@
 import {
   createWalletClient,
-  http,
   parseAbi,
   formatEther,
   parseEther,
@@ -30,7 +29,7 @@ import {
   NATIVE_ETH,
 } from './config.js';
 import { normalizeAddress, pruneSeen } from './utils.js';
-import { publicClient } from './lib/rpc.js';
+import { publicClient, createFailoverHttpTransport } from './lib/rpc.js';
 import {
   buildV4SwapInput,
   classifyV4Failure,
@@ -155,7 +154,7 @@ function ensureWallet() {
   walletClient = createWalletClient({
     account,
     chain: CHAIN,
-    transport: http(RPC_URL),
+    transport: createFailoverHttpTransport(),
   });
   return { walletClient, account };
 }
@@ -681,7 +680,7 @@ async function executeSwapV4({ poolKey, amountIn, isNativeIn, memeToken, deadlin
       ? 0n
       : await fetchLiveTokenBalance(memeToken);
 
-    const hash = await walletClient.writeContract(request);
+    const hash = walletClient.writeContract({ ...request, account });
     const receipt = await publicClient.waitForTransactionReceipt({ hash });
 
     let received;
@@ -778,7 +777,7 @@ async function executeSwapV3({ route, amountIn, isNativeIn, memeToken, deadline 
     const beforeToken = isNativeIn ? await fetchLiveTokenBalance(memeToken) : 0n;
     const beforeWeth = !isNativeIn ? await wethBalance(account.address) : 0n;
 
-    const hash = await walletClient.writeContract(request);
+    const hash = walletClient.writeContract({ ...request, account });
     const receipt = await publicClient.waitForTransactionReceipt({ hash });
 
     let received;
