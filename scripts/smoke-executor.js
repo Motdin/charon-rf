@@ -337,4 +337,63 @@ ok('kegagalan setelah tx tersiar tidak me-rollback wrap', () => {
   assert.ok(/err\.broadcast = true/.test(src), 'error harus ditandai broadcast agar bisa direkonsiliasi');
 });
 
+// ─── Regresi: jalur JUAL tidak boleh diveto heuristik likuiditas ─────────────
+// getLiquidity = likuiditas pada tick AKTIF saja. Memecoin yang harganya jatuh
+// keluar dari range LP melaporkan 0 padahal pool masih bisa di-swap dengan
+// melintasi tick. Memveto rute atas dasar ini mengunci posisi → "token tidak
+// bisa dijual, tidak ada pair aktif".
+await okAsync('pickMostLiquidPool: allowZeroLiquidity menyelamatkan rute EXIT', async () => {
+  const pools = [
+    { poolId: '0xaaaa', poolKey: { fee: 3000 } },
+    { poolId: '0xbbbb', poolKey: { fee: 10000 } },
+  ];
+  const fakeClient = {
+    async readContract() {
+      return 0n; // semua tick-aktif kosong, tapi pool DIKENAL PoolManager
+    },
+  };
+  const sv = '0x' + '2'.repeat(40);
+
+  // Beli (default): tetap ditolak — perilaku lama dipertahankan.
+  assert.equal(await pickMostLiquidPool(fakeClient, sv, pools), null);
+
+  // Jual: harus dapat kandidat supaya quoter yang memutuskan.
+  const exit = await pickMostLiquidPool(fakeClient, sv, pools, { allowZeroLiquidity: true });
+  assert.ok(exit, 'jalur exit harus tetap mendapat pool kandidat');
+  assert.equal(exit.poolId, '0xaaaa');
+  assert.equal(exit.liquidity, 0n);
+});
+
+await okAsync('pickMostLiquidPool: pool HANTU (getLiquidity revert) tetap ditolak saat exit', async () => {
+  const pools = [{ poolId: '0xdead', poolKey: {} }];
+  const fakeClient = {
+    async readContract() {
+      throw new Error('execution reverted'); // bukan pool PoolManager ini
+    },
+  };
+  const exit = await pickMostLiquidPool(fakeClient, '0x' + '2'.repeat(40), pools, { allowZeroLiquidity: true });
+  assert.equal(exit, null, 'pool hantu tidak boleh dipakai walau untuk exit');
+});
+
+ok('cooldown kegagalan hanya memblok BELI, tidak memblok JUAL', () => {
+  const src = readFileSync(new URL('../src/liveExecutor.js', import.meta.url), 'utf8');
+  const body = src.slice(src.indexOf('export async function executeJupiterSwap'));
+  const guard = body.slice(0, body.indexOf('const deadline'));
+  const coolIdx = guard.indexOf('mintCooldownLeft(memeToken)');
+  const buyOnlyIdx = guard.indexOf('if (isNativeIn)');
+  assert.ok(coolIdx > -1 && buyOnlyIdx > -1, 'gate cooldown harus ada');
+  assert.ok(
+    buyOnlyIdx < coolIdx,
+    'mintCooldownLeft harus berada DI DALAM cabang isNativeIn (beli) — exit wajib selalu boleh dicoba'
+  );
+});
+
+ok('resolveSwapRoute melonggarkan gate likuiditas khusus untuk jual', () => {
+  const src = readFileSync(new URL('../src/liveExecutor.js', import.meta.url), 'utf8');
+  assert.ok(
+    /resolveSwapRoute\(memeToken, dexPair, \{ allowZeroLiquidity: !isNativeIn \}\)/.test(src),
+    'executeJupiterSwap harus meneruskan allowZeroLiquidity untuk sisi jual'
+  );
+});
+
 console.log(`\n✓ smoke-executor PASSED (${passed} tests)`);

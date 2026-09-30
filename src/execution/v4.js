@@ -272,10 +272,20 @@ export async function findV4Pools(client, poolManager, { poolIdHint = null, curr
  * lintas PoolManager, atau LP sudah ditarik) DITOLAK — menukar di pool
  * zero-liq hanya menghasilkan quoter revert (UnexpectedRevertBytes) dan
  * nyata terjadi live (token 0x9e7a…c86, pool 0x1057c266…c2307).
+ *
+ * ⚠️ `allowZeroLiquidity` (dipakai HANYA untuk JUAL):
+ * getLiquidity mengembalikan likuiditas pada tick AKTIF saja. Di pool
+ * concentrated, harga yang jatuh keluar dari semua range LP membuat nilainya
+ * 0 padahal pool masih berisi token dan masih bisa di-swap dengan melintasi
+ * tick. Memveto rute atas dasar ini akan MENGUNCI posisi — persis skenario
+ * "token tidak bisa dijual, tidak ada pair aktif". Untuk exit, quoter-lah
+ * otoritasnya, bukan heuristik likuiditas. Pool yang getLiquidity-nya
+ * REVERT tetap ditolak (itu pool hantu dari venue lain).
  */
-export async function pickMostLiquidPool(client, stateView, pools) {
+export async function pickMostLiquidPool(client, stateView, pools, { allowZeroLiquidity = false } = {}) {
   let best = null;
   let bestLiq = 0n; // sentinel 0, bukan -1: pool zero-liquidity tak pernah menang
+  let readableFallback = null;
   for (const entry of pools || []) {
     let liq = 0n;
     try {
@@ -287,14 +297,16 @@ export async function pickMostLiquidPool(client, stateView, pools) {
         args: [entry.poolId],
       });
     } catch {
-      continue;
+      continue; // pool tidak dikenal PoolManager ini → hantu, jangan dipakai
     }
+    if (!readableFallback) readableFallback = { ...entry, liquidity: liq };
     if (liq > bestLiq) {
       bestLiq = liq;
       best = { ...entry, liquidity: liq };
     }
   }
-  return best;
+  if (best) return best;
+  return allowZeroLiquidity ? readableFallback : null;
 }
 
 // ─── Klasifikasi kegagalan (pesan ramah untuk Telegram) ───────────────────────

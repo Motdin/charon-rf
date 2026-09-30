@@ -406,3 +406,65 @@ Semua temuan di atas diverifikasi langsung pada checkout ini:
 - Bug K-1 direproduksi dengan `node -e` (`BigInt("2.5e+24")` → TypeError)
 - Encoding/CRLF dipindai per-file dengan `grep`/`od`
 - Selisih env var dihitung dengan `comm` antara `.env.example` dan hasil grep `process.env.*`
+
+---
+
+## 9. Investigasi lanjutan: "token tidak bisa dijual, tidak ada pair aktif"
+
+Tiga bug terpisah di jalur EXIT, semuanya membuat bot menolak menjual padahal
+pool-nya kemungkinan masih bisa di-swap. Ketiganya sudah diperbaiki.
+
+### 🔴 E-1 · Likuiditas tick-aktif dipakai memveto rute **[SUDAH DIPERBAIKI]**
+
+`pickMostLiquidPool()` menolak pool dengan `getLiquidity == 0`, dan
+`resolveV3Route()` hanya menerima pool dengan `liquidity > 0n`. Kalau semua
+kandidat nol, `resolveSwapRoute()` mengembalikan `null` → pesan
+`No swap route for 0x… — tidak ada pool V3 (WETH) maupun V4 (ETH) dengan likuiditas`.
+Itulah "tidak ada pair yang aktif".
+
+Masalahnya: **`StateView.getLiquidity(poolId)` hanya melaporkan likuiditas pada
+tick AKTIF**, bukan total isi pool. Di pool concentrated (V3/V4), harga yang
+jatuh keluar dari seluruh range LP membuat nilainya 0 — padahal pool masih
+berisi token dan swap tetap bisa jalan dengan melintasi tick ke range yang
+masih punya likuiditas.
+
+Akibatnya asimetris dan berbahaya: bot **membeli** saat harga masih di dalam
+range LP, lalu harga anjlok (hal paling normal untuk memecoin), tick aktif
+keluar dari range → `getLiquidity` jadi 0 → bot **menolak bahkan mencoba
+menjual**. Posisi terkunci tepat ketika exit paling dibutuhkan.
+
+Perbaikan: opsi `allowZeroLiquidity`, aktif **hanya untuk jual**. Untuk exit,
+**quoter yang jadi otoritas**, bukan heuristik likuiditas. Perilaku beli tidak
+berubah (regresi pool zero-liq 0x9e7a…c86 tetap dijaga), dan pool yang
+`getLiquidity`-nya *revert* (pool hantu dari venue lain) tetap ditolak.
+
+### 🔴 E-2 · Cooldown kegagalan ikut memblok jalur jual **[SUDAH DIPERBAIKI]**
+
+`executeJupiterSwap()` mengecek `mintCooldownLeft(memeToken)` **sebelum**
+cabang `if (isNativeIn)`, jadi gate itu mengenai beli *dan* jual. Padahal
+`poisonPool()` memanggil `blockMint()` saat quote gagal — termasuk quote jual.
+
+Efeknya berantai: satu quote jual yang gagal → mint masuk cooldown 30 menit →
+setiap percobaan exit berikutnya ditolak mentah-mentah **tanpa menyentuh chain
+sama sekali**. Ini bertentangan langsung dengan prinsip yang sudah ditulis
+sendiri di repo untuk `routelessCooldown`: *"Untuk JUAL sengaja tidak
+di-cooldown: exit posisi harus terus dicoba."*
+
+Perbaikan: `mintCooldownLeft` dipindahkan ke dalam cabang `isNativeIn`.
+
+### 🟡 E-3 · Diagnostik tidak bisa membedakan rug dari bug **[DIPERBAIKI]**
+
+`scripts/probe-route.js` lama hanya menguji arah BELI dan langsung `exit(1)`
+begitu rute tidak ketemu — persis kasus yang paling perlu didiagnosis.
+
+Sekarang skrip itu: menampilkan rute beli **dan** jual (gate longgar), melaporkan
+likuiditas tanpa memveto, dan menjalankan **quote bulak-balik**
+(beli X ETH → Y token → jual Y token → Z ETH). Pola hasilnya langsung
+memisahkan penyebab:
+
+| Hasil | Arti |
+|---|---|
+| beli OK, jual revert | **honeypot** — transfer/jual di-gate |
+| dua arah OK, Z ≈ X | pool sehat, dulu hanya gagal resolve (bug E-1/E-2) |
+| dua arah OK, Z ≪ X | pajak tinggi / likuiditas nyaris habis |
+| dua arah revert | LP ditarik habis, atau pool hidup di venue lain |
