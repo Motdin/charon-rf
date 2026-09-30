@@ -13,6 +13,7 @@ import { escapeHtml, fmtEth, fmtPct, fmtUsd, short, now } from '../utils.js';
 import { executeConfirmedIntent, rejectIntent } from '../execution/router.js';
 import { closePositionManually } from '../execution/positions.js';
 import { gmgnWeightStatus } from '../enrichment/gmgn.js';
+import { llmStatus } from '../pipeline/llm.js';
 import { addSavedWallet, removeSavedWallet, listSavedWallets } from '../enrichment/wallets.js';
 import { checkTokenSecurity, summarizeSecurity } from '../enrichment/security.js';
 import {
@@ -455,6 +456,11 @@ export function startTelegramBot() {
             const gmgnLine = w.enabled
               ? `GMGN: weight ${w.spent}/${w.budget} (left ${w.remaining})`
               : 'GMGN: off → DexScreener + Blockscout';
+            const ls = llmStatus();
+            const llmLine =
+              `LLM: ${ls.callsHour}/${ls.maxHour || '∞'} per jam · ${ls.callsDay}/${ls.maxDay || '∞'} per hari` +
+              (ls.backingOff ? ` · ⏸ backoff ${ls.backoffRemainingSec}s (429)` : '') +
+              (ls.backupConfigured ? ` · backup ${ls.backupActive ? 'AKTIF' : 'siaga'}` : ' · tanpa backup');
             await sendTelegram(
               [
                 `<b>${APP_NAME} status</b>`,
@@ -463,6 +469,7 @@ export function startTelegramBot() {
                 `Open positions: ${opens}/${activeStrategy().max_open_positions ?? numSetting('max_open_positions', 3)}`,
                 `Agent: ${boolSetting('agent_enabled', true) ? 'ON' : 'OFF'}`,
                 gmgnLine,
+                llmLine,
               ].join('\n')
             );
             break;

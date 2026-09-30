@@ -46,6 +46,9 @@ export const PERMIT2_ADDRESS = process.env.PERMIT2_ADDRESS || '0x000000000022D47
 export const LIVE_V4_ENABLED = process.env.LIVE_V4_ENABLED !== 'false';
 // Lower bound log-scan: blok deploy protokol Uniswap di RH Chain (hemat RPC getLogs)
 export const V4_DEPLOY_BLOCK = BigInt(process.env.V4_DEPLOY_BLOCK || 7_887_312);
+// Ukuran chunk getLogs saat RPC membatasi rentang blok (drpc free = 10.000).
+// Scanner menurunkan otomatis bila tetap ditolak — nilai ini hanya titik awal.
+export const LOG_SCAN_CHUNK_BLOCKS = Number(process.env.LOG_SCAN_CHUNK_BLOCKS || 10_000);
 
 // Live execution safety
 export const SWAP_DEADLINE_SECONDS = Number(process.env.SWAP_DEADLINE_SECONDS || 300);
@@ -65,6 +68,17 @@ export const LLM_API_KEY = process.env.LLM_API_KEY || '';
 export const LLM_MODEL = process.env.LLM_MODEL || 'gpt-4o-mini';
 export const LLM_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS || 60_000);
 export const ENABLE_LLM = process.env.ENABLE_LLM !== 'false';
+
+// Provider cadangan (OpenAI-compatible) — dicoba otomatis saat utama 429/error.
+// Gratis yang cocok: Groq (api.groq.com/openai/v1), Google AI Studio
+// (generativelanguage.googleapis.com/v1beta/openai), Cerebras, OpenRouter.
+export const LLM_BACKUP_BASE_URL = process.env.LLM_BACKUP_BASE_URL || '';
+export const LLM_BACKUP_API_KEY = process.env.LLM_BACKUP_API_KEY || '';
+export const LLM_BACKUP_MODEL = process.env.LLM_BACKUP_MODEL || '';
+
+// Pelindung kuota free tier: 0 = tanpa batas. Counter in-memory (reset saat restart).
+export const LLM_MAX_CALLS_PER_HOUR = Number(process.env.LLM_MAX_CALLS_PER_HOUR || 40);
+export const LLM_MAX_CALLS_PER_DAY = Number(process.env.LLM_MAX_CALLS_PER_DAY || 400);
 
 export const DEXSCREENER_ENABLED = process.env.DEXSCREENER_ENABLED !== 'false';
 // Discovery = search/profiles/trending.

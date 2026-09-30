@@ -10,7 +10,7 @@ import { createDryRunPosition, openPositions, canOpenMorePositions, openPosition
 import { upsertCandidate, storeDecision, storeBatchDecision, recentEligibleCandidates, candidateById } from '../src/db/candidates.js';
 import { decideCandidateBatch } from '../src/pipeline/llm.js';
 import { estimateRugScore } from '../src/enrichment/blockscout.js';
-import { normalizeDecision } from '../src/pipeline/llm.js';
+import { normalizeDecision, llmStatus, llmGuardCheck, noteLlmFailure, noteLlmSuccess } from '../src/pipeline/llm.js';
 import { pickMemeSide, quoteSideIsCurrency0 } from '../src/signals/uniswapEvents.js';
 import { WETH_ADDRESS, USDG_ADDRESS } from '../src/config.js';
 
@@ -139,6 +139,21 @@ console.log('â€” normalizeDecision clamps â€”');
 const nd = normalizeDecision({ verdict: 'buy', confidence: 150, reason: 'x', risks: 'nope' });
 assert(nd.verdict === 'BUY', 'verdict uppercased');
 assert(nd.confidence === 100, 'confidence clamped to 100');
+
+console.log('— LLM guard: 429 backoff & recovery (kasus free tier habis) —');
+assert(llmGuardCheck().skip === false, 'guard open initially');
+assert(llmStatus().backingOff === false, 'no backoff initially');
+noteLlmFailure({ response: { status: 429 }, message: 'Request failed with status code 429' });
+const st1 = llmStatus();
+assert(st1.backingOff === true && st1.backoffRemainingSec > 0, '429 → backoff active');
+const g1 = llmGuardCheck();
+assert(g1.skip === true && g1.kind === 'llm_backoff', `guard skips during backoff (${g1.kind})`);
+noteLlmFailure(new Error('Request failed with status code 429'));
+const st2 = llmStatus();
+assert(st2.backoffRemainingSec >= st1.backoffRemainingSec, `consecutive 429 extends backoff (${st1.backoffRemainingSec}s → ${st2.backoffRemainingSec}s)`);
+noteLlmSuccess();
+assert(llmStatus().backingOff === false, 'success clears backoff');
+assert(llmGuardCheck().skip === false, 'guard open again after success');
 
 console.log('\nALL SMOKE TESTS PASSED');
 process.exit(0);

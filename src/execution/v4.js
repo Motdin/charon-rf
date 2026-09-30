@@ -1,5 +1,6 @@
 import { encodeAbiParameters, concatHex, keccak256, parseAbi, parseAbiItem } from 'viem';
-import { V4_DEPLOY_BLOCK } from '../config.js';
+import { V4_DEPLOY_BLOCK, LOG_SCAN_CHUNK_BLOCKS } from '../config.js';
+import { sleep } from '../utils.js';
 
 /**
  * Uniswap V4 di Robinhood Chain — helper murni + reader on-chain.
@@ -138,24 +139,87 @@ function decodeInitializeLog(log) {
 }
 
 /**
- * getLogs dengan fallback chunking — RPC publik ada yang membatasi rentang blok.
+ * Ekstrak batas blok maksimum dari pesan error RPC.
+ * drpc free: "ranges over 10000 blocks are not supported on free plan"
  */
-async function getLogsChunked(client, params, { deployBlock = V4_DEPLOY_BLOCK, chunkSize = 5_000_000n } = {}) {
+export function parseRangeLimit(msg) {
+  const m = String(msg || '').match(/(\d[\d_,]*)\s*blocks/i);
+  if (!m) return null;
   try {
-    return await client.getLogs({ ...params, fromBlock: BigInt(deployBlock), toBlock: 'latest' });
-  } catch (err) {
-    const msg = String(err?.message || err?.shortMessage || '');
-    if (!/range|limit|exceed|too many|10_?000|batch/i.test(msg)) throw err;
+    const n = BigInt(m[1].replace(/[_,]/g, ''));
+    return n > 0n ? n : null;
+  } catch {
+    return null;
   }
+}
+
+function isRangeLimitError(err) {
+  const msg = String(err?.message || err?.shortMessage || err?.details || '');
+  return /range|limit|exceed|too many|batch|blocks/i.test(msg);
+}
+
+/**
+ * getLogs dengan chunking ADAPTIF — RPC publik membatasi rentang blok per call
+ * (drpc free = 10.000 blok → scan Initialize ~5 juta blok gagal total;
+ * kasus live #43 VRAX). Strategi:
+ *   1) fast path: coba full range (beberapa RPC mengizinkan)
+ *   2) limit error → pakai angka limit dari pesan error, atau
+ *      LOG_SCAN_CHUNK_BLOCKS (default 10.000 — aman semua free plan)
+ *   3) masih ditolak → chunk dibelah dua sampai diterima (min 500 blok)
+ *   4) 429 per-chunk → sleep sejenak lalu retry chunk yang sama
+ */
+export async function getLogsChunked(client, params, { deployBlock = V4_DEPLOY_BLOCK, chunkSize = null } = {}) {
+  const fromStart = BigInt(deployBlock);
+  let derived = chunkSize ? BigInt(chunkSize) : null;
+  try {
+    return await client.getLogs({ ...params, fromBlock: fromStart, toBlock: 'latest' });
+  } catch (err) {
+    if (!isRangeLimitError(err)) throw err;
+    if (!derived) {
+      derived =
+        parseRangeLimit(err?.message) ||
+        parseRangeLimit(err?.details) ||
+        BigInt(LOG_SCAN_CHUNK_BLOCKS || 10_000);
+    }
+  }
+
   const latest = await client.getBlockNumber();
+  if (latest <= fromStart) return [];
+
+  let chunk = derived > 0n ? derived : 10_000n;
+  const MIN_CHUNK = 500n;
   const out = [];
-  let from = BigInt(deployBlock);
+  let from = fromStart;
+  let iter = 0;
+  let retries429 = 0;
+
+  console.log(`[route] scan logs chunked: blok ${fromStart}→${latest} (~${(latest - fromStart) / chunk} chunk @${chunk})`);
+
   while (from <= latest) {
-    const to = from + chunkSize - 1n > latest ? latest : from + chunkSize - 1n;
-    // eslint-disable-next-line no-await-in-loop
-    const chunk = await client.getLogs({ ...params, fromBlock: from, toBlock: to });
-    out.push(...chunk);
-    from = to + 1n;
+    if (++iter > 30_000) throw new Error('log scan abort: iterasi chunk berlebihan');
+    const to = from + chunk - 1n > latest ? latest : from + chunk - 1n;
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      const part = await client.getLogs({ ...params, fromBlock: from, toBlock: to });
+      out.push(...part);
+      from = to + 1n;
+      retries429 = 0;
+    } catch (err) {
+      const text = String(err?.message || err?.shortMessage || err?.details || '');
+      if (/\b429\b|too many requests|rate.?limit/i.test(text) && retries429 < 5) {
+        retries429++;
+        await sleep(1500 * retries429);
+        continue; // retry chunk yang sama
+      }
+      if (isRangeLimitError(err) && chunk > MIN_CHUNK) {
+        const parsed = parseRangeLimit(err?.message) || parseRangeLimit(err?.details);
+        chunk = parsed && parsed < chunk ? parsed : chunk / 2n;
+        if (chunk < MIN_CHUNK) chunk = MIN_CHUNK;
+        console.log(`[route] RPC menolak rentang — chunk diturunkan ke ${chunk} blok`);
+        continue;
+      }
+      throw err;
+    }
   }
   return out;
 }

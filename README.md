@@ -504,6 +504,35 @@ node scripts/revoke-weth.js [spender...]         # clean WETH approvals to dead 
 
 ---
 
+## LLM providers & quota safety
+
+Any **OpenAI-compatible** provider works (`LLM_BASE_URL` + `LLM_API_KEY` + `LLM_MODEL`).
+Free tiers that fit a trench bot's call volume:
+
+| Provider | `LLM_BASE_URL` | Example `LLM_MODEL` | Free tier (approx.) |
+|---|---|---|---|
+| **Groq** | `https://api.groq.com/openai/v1` | `llama-3.3-70b-versatile` | ~14k req/day |
+| **Google AI Studio** | `https://generativelanguage.googleapis.com/v1beta/openai` | `gemini-2.0-flash` | ~1.5k req/day |
+| **Cerebras** | `https://api.cerebras.ai/v1` | `llama-3.3-70b` | ~1M tokens/day |
+| **OpenRouter** | `https://openrouter.ai/api/v1` | `meta-llama/llama-3.3-70b-instruct:free` | ~50 req/day (`:free` models) |
+
+> Limits change — check the provider's current page. The response is parsed as
+> strict JSON, and the parser also salvages JSON from non-`json_object` models.
+
+Built-in quota protection (works with any provider):
+
+- **429/error backoff** — consecutive failures pause ALL LLM calls
+  exponentially (5 min → 30 min max). While paused, candidates become WATCH
+  (no buys happen without LLM insight — fail-safe by design)
+- **Call budget** — `LLM_MAX_CALLS_PER_HOUR` (default 40) and
+  `LLM_MAX_CALLS_PER_DAY` (default 400); `0` = unlimited
+- **Backup provider** — set `LLM_BACKUP_BASE_URL` / `LLM_BACKUP_API_KEY` /
+  `LLM_BACKUP_MODEL` and the bot fails over automatically when the primary
+  429s out. Pair two free providers (e.g. Groq primary + Gemini backup) and
+  you effectively never stop screening
+- Counters are in-memory (restart resets them); check usage anytime with
+  `/status` → `LLM: x/40 per jam · x/400 per hari · backup siaga`
+
 ## Risk controls
 
 - Fixed position size per strategy (`position_size_eth`)

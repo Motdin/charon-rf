@@ -14,6 +14,8 @@ import { decodeFunctionData } from 'viem';
 import {
   buildV4SwapInput,
   classifyV4Failure,
+  getLogsChunked,
+  parseRangeLimit,
   pickMostLiquidPool,
   poolIdFromKey,
   UNIVERSAL_ROUTER_ABI,
@@ -217,6 +219,84 @@ ok('classifyV4Failure: selector → dikenali, empty revert → gate hint', () =>
 
   cls = classifyV4Failure(new Error('some random rpc timeout'));
   assert.equal(cls.raw, 'unknown');
+});
+
+// ── getLogsChunked adaptif (drpc free = 10.000 blok; kasus live #43 VRAX) ──
+
+ok('parseRangeLimit: angka limit dari pesan error', () => {
+  assert.equal(parseRangeLimit('ranges over 10000 blocks are not supported on free plan'), 10_000n);
+  assert.equal(parseRangeLimit('query returned more than 5,000 blocks'), 5_000n);
+  assert.equal(parseRangeLimit('block range too large'), null);
+  assert.equal(parseRangeLimit(''), null);
+});
+
+/** Fake RPC client: fast-path full range SELALU ditolak dg pesan limit drpc; chunk > maxRange juga ditolak. */
+function makeLimitedClient({ maxRange, latest, logMsg }) {
+  const calls = [];
+  return {
+    calls,
+    async getBlockNumber() {
+      return BigInt(latest);
+    },
+    async getLogs({ fromBlock, toBlock }) {
+      const to = toBlock === 'latest' ? BigInt(latest) : BigInt(toBlock);
+      calls.push([BigInt(fromBlock), to]);
+      if (to - BigInt(fromBlock) + 1n > BigInt(maxRange)) {
+        throw new Error(logMsg ?? `ranges over ${maxRange} blocks are not supported on free plan`);
+      }
+      return [`log@${fromBlock}-${to}`];
+    },
+  };
+}
+
+/** Rentang dari log palsu 'log@from-to' + verifikasi cakupan kontigu tanpa celah. */
+function logRanges(logs) {
+  return logs.map((l) => l.replace('log@', '').split('-').map(BigInt));
+}
+function assertContiguousCoverage(logs, start, latest, maxSpan) {
+  const ranges = logRanges(logs);
+  assert.ok(ranges.length > 0, 'tidak ada log');
+  assert.equal(ranges[0][0], BigInt(start), 'chunk pertama mulai di deployBlock');
+  for (let i = 1; i < ranges.length; i++) {
+    assert.equal(ranges[i][0], ranges[i - 1][1] + 1n, 'tidak boleh ada celah antar chunk');
+  }
+  assert.equal(ranges[ranges.length - 1][1], BigInt(latest), 'chunk terakhir sampai latest');
+  for (const [from, to] of ranges) {
+    assert.ok(to - from + 1n <= BigInt(maxSpan), `chunk diterima ${from}..${to} melampaui limit`);
+  }
+}
+
+await okAsync('getLogsChunked: adopsi limit 10.000 dari pesan error (fast path ditolak)', async () => {
+  const client = makeLimitedClient({ maxRange: 10_000, latest: 119_999 });
+  const logs = await getLogsChunked(client, { address: '0x' + '11'.repeat(20) }, { deployBlock: 100_000 });
+  assert.equal(logs.length, 2); // 100000..109999, 110000..119999
+  assertContiguousCoverage(logs, 100_000, 119_999, 10_000);
+});
+
+await okAsync('getLogsChunked: tanpa angka di pesan → halving adaptif', async () => {
+  // Server hanya menerima ≤ 1500 blok; pesan error TIDAK menyebut angka
+  const client = makeLimitedClient({ maxRange: 1_500, latest: 3_000, logMsg: 'block range exceeds limit' });
+  const logs = await getLogsChunked(client, { address: '0x' + '22'.repeat(20) }, { deployBlock: 1_000 });
+  assert.ok(logs.length >= 2, 'range 2000 blok ter-cover penuh via chunk mengecil');
+  assertContiguousCoverage(logs, 1_000, 3_000, 1_500);
+});
+
+await okAsync('getLogsChunked: error non-limit dilempar ulang', async () => {
+  const client = {
+    async getBlockNumber() {
+      return 5n;
+    },
+    async getLogs() {
+      throw new Error('network unreachable');
+    },
+  };
+  let threw = false;
+  try {
+    await getLogsChunked(client, {}, { deployBlock: 1 });
+  } catch (err) {
+    threw = /network unreachable/.test(String(err.message));
+  }
+  assert.equal(threw, true);
 });
 
 console.log(`\n✓ smoke-executor PASSED (${passed} tests)`);

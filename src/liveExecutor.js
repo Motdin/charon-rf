@@ -112,6 +112,14 @@ const PERMIT2_EXPIRY_S = 30 * 24 * 3600; // 30 hari
 const MINT_FAIL_COOLDOWN_MS = Number(process.env.LIVE_MINT_FAIL_COOLDOWN_MS || 30 * 60_000);
 const mintFailCooldown = new Map(); // mint → lastFailMs
 
+/**
+ * Cooldown khusus "route tidak ditemukan" — HANYA memblok BELI.
+ * Terpisah dari mintFailCooldown: jalur JUAL tidak boleh ikut terblokir
+ * (exit posisi harus selalu dicoba ulang).
+ */
+const ROUTELESS_COOLDOWN_MS = Number(process.env.LIVE_ROUTELESS_COOLDOWN_MS || 30 * 60_000);
+const routelessCooldown = new Map(); // mint → lastRoutelessMs
+
 function blockMint(meme) {
   // Buang entri kedaluwarsa agar Map tidak tumbuh tanpa batas di uptime panjang
   pruneSeen(mintFailCooldown, MINT_FAIL_COOLDOWN_MS);
@@ -122,6 +130,17 @@ function mintCooldownLeft(meme) {
   const last = mintFailCooldown.get(meme);
   if (!last) return 0;
   return Math.max(0, MINT_FAIL_COOLDOWN_MS - (Date.now() - last));
+}
+
+function blockRoutelessMint(meme) {
+  pruneSeen(routelessCooldown, ROUTELESS_COOLDOWN_MS);
+  routelessCooldown.set(meme, Date.now());
+}
+
+function routelessCooldownLeft(meme) {
+  const last = routelessCooldown.get(meme);
+  if (!last) return 0;
+  return Math.max(0, ROUTELESS_COOLDOWN_MS - (Date.now() - last));
 }
 
 let walletClient = null;
@@ -846,12 +865,32 @@ export async function executeJupiterSwap({ inputMint, outputMint, amount, dexPai
         `gagal struktural sebelumnya; dilewati demi keamanan`
     );
   }
+  if (isNativeIn) {
+    const rlLeft = routelessCooldownLeft(memeToken);
+    if (rlLeft > 0) {
+      throw new Error(
+        `${memeToken.slice(0, 12)}… tidak punya swap route (${Math.ceil(rlLeft / 60000)} menit cooldown lagi) — ` +
+          `pool V3/V4 tidak ditemukan; dilewati tanpa rescan`
+      );
+    }
+  }
   const deadline = Math.floor(Date.now() / 1000) + SWAP_DEADLINE_SECONDS;
 
   const resolved = route || (await resolveSwapRoute(memeToken, dexPair));
   if (!resolved) {
+    // Cooldown HANYA untuk beli — jangan rescan ~5 juta blok untuk token tanpa
+    // route setiap siklus (kasus #48/#52: VRAX/CC dipindai berulang-ulang).
+    // Untuk JUAL sengaja tidak di-cooldown: exit posisi harus terus dicoba.
+    if (isNativeIn) blockRoutelessMint(memeToken);
+    const venue = String(dexPair?.dexId || '').toLowerCase();
+    const venueNote =
+      venue && !venue.includes('uniswap')
+        ? ` Pair DexScreener ada di venue "${dexPair.dexId}" — di luar Uniswap, eksekutor ini tidak mendukungnya.`
+        : '';
     throw new Error(
-      `No swap route for ${memeToken} — tidak ada pool V3 (WETH) maupun V4 (ETH) dengan likuiditas.`
+      `No swap route for ${memeToken} — tidak ada pool V3 (WETH) maupun V4 (ETH) dengan likuiditas. ` +
+        `(${isNativeIn ? 'mint cooldown 30 menit; ' : ''}jika terus terjadi: pool mungkin ber-quote non-ETH/WETH,` +
+        ` pool sudah ada sebelum blok V4_DEPLOY_BLOCK, atau RPC menolak rentang log — lihat baris [route] di log).${venueNote}`
     );
   }
 
