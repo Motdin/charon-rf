@@ -25,6 +25,7 @@ import { refreshCandidateForExecution } from '../execution/positions.js';
 import { sendTelegram, sendPositionOpen, sendTradeIntent, sendBatchReveal } from '../telegram/send.js';
 import { candidateSummary } from '../telegram/format.js';
 import { short, escapeHtml, now, pruneSeen } from '../utils.js';
+import { createMutex } from '../lib/mutex.js';
 import { storePriceAlert } from '../db/candidates.js';
 
 export const seenSignalCandidates = new Map();
@@ -32,7 +33,22 @@ export const seenSignalCandidates = new Map();
 /**
  * Main entry: a signal arrived from DexScreener / on-chain / price alert.
  */
+/**
+ * Seluruh pipeline kandidat dijalankan eksklusif. Lihat src/lib/mutex.js:
+ * tanpa ini, dua sinyal konkuren bisa sama-sama lolos gate max_open_positions
+ * dan membuka posisi melebihi batas risiko yang diset user.
+ */
+const pipelineLock = createMutex();
+
 export async function processCandidateFromSignals(signalPayload) {
+  return pipelineLock.runExclusive(() => processCandidateFromSignalsImpl(signalPayload));
+}
+
+export function pipelineQueueDepth() {
+  return pipelineLock.pending;
+}
+
+async function processCandidateFromSignalsImpl(signalPayload) {
   const strat = activeStrategy();
 
   if (!canOpenMorePositions()) {
@@ -311,13 +327,18 @@ export async function handleApprovedBuy(selectedRow, decision, batchId, rows = [
       strategyId: strat.id,
       execution: { intentId, error: err.message },
     });
+    // Kalau tx sudah tersiar, ini BUKAN sekadar "gagal" — dana sudah keluar
+    // tanpa posisi yang memantau TP/SL. Harus berteriak, bukan berbisik.
+    const broadcast = err.broadcast === true;
     await sendTelegram([
-      '🛑 <b>Live trade failed</b>',
+      broadcast ? '🚨 <b>DANA SUDAH KELUAR — posisi TIDAK tercatat</b>' : '🛑 <b>Live trade failed</b>',
       '',
       candidateSummary(freshSelectedRow.candidate, decision),
       '',
+      broadcast ? `Tx: <code>${escapeHtml(err.txHash || '?')}</code>` : '',
+      broadcast ? '⚠️ Token ada di wallet tanpa TP/SL. Rekonsiliasi manual diperlukan.' : '',
       `Intent #${intentId} stored.`,
       `Error: ${escapeHtml(err.message)}`,
-    ].join('\n'));
+    ].filter(Boolean).join('\n'));
   }
 }

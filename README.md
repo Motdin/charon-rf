@@ -103,6 +103,9 @@ SLIPPAGE_BPS=300
                    hot-edit any strategy parameter (no restart)
                    e.g. /stratset sniper tp_percent 75
 /positions         open + closed (entry/exit USD price + CA)
+/adopt <mint> [size_eth] [entry_usd]
+                   catat token yang SUDAH ada di wallet sebagai posisi
+                   terpantau (TP/SL aktif). Tidak mengirim transaksi.
 /pnl               win rate + net ETH
 /pnlcard [YYYY-MM-DD]
                    daily PnL card PNG (1200×675) ready for X / Twitter
@@ -660,3 +663,24 @@ ETH : 0xE022E11cA86eFd2Aaa75A482B431738b2f45b3d5
 
 SOL : GmkNNLK6dVPAoT3YdbKUXNbANEfHTaEL7NGAsvABZCQJ
 ```
+
+### Security hardening
+
+When `TELEGRAM_CHAT_ID` points to a group, you must set `TELEGRAM_ALLOWED_USER_IDS` to
+a comma-separated allowlist of Telegram numeric user IDs. Chat ID alone only
+identifies the group; without a user allowlist every group member can issue
+state-changing commands such as `/mode live`, `/confirm`, and `/close`.
+
+```env
+TELEGRAM_ALLOWED_USER_IDS=123456789,987654321
+```
+
+The candidate pipeline is serialized with a FIFO mutex so concurrent signal
+sources cannot race the `max_open_positions` risk gate. Token metadata sent to
+the LLM is control-character-normalized and length-limited; metadata is always
+treated as untrusted data. Live PnL is net of entry/exit/partial-TP gas and
+includes proceeds already realized by partial TP.
+
+Runtime requires Node.js **22.5 or newer** because the database uses the built-in
+`node:sqlite` module. CI runs syntax checks, all offline smoke suites, and
+`npm audit --audit-level=high` on every push and pull request.

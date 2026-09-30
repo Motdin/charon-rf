@@ -7,6 +7,13 @@ import {
   updateTokenAmount,
   recordTrade,
   tradingMode,
+  createAdoptedPosition,
+  hasOpenPositionForMint,
+  openPositionIdForMint,
+  addPositionGas,
+  positionGasEth,
+  addRealizedProceeds,
+  realizedProceedsEth,
 } from '../db/positions.js';
 import { strategyById, activeStrategy, numSetting } from '../db/settings.js';
 import { updateCandidateSnapshot } from '../db/candidates.js';
@@ -14,8 +21,10 @@ import { enrichToken } from '../enrichment/index.js';
 import { filterCandidate } from '../pipeline/candidateBuilder.js';
 import { fetchDexPair, trending } from '../signals/dexscreener.js';
 import { executeLiveSell } from './router.js';
+import { fetchLiveTokenBalance, resolveSwapRoute } from '../liveExecutor.js';
 import { sendPositionExit, sendTelegram } from '../telegram/send.js';
-import { now, toNumber, firstPositiveNumber, fmtPct } from '../utils.js';
+import { now, toNumber, firstPositiveNumber, fmtPct, escapeHtml } from '../utils.js';
+import { portionOfRawAmount, toRawAmountString } from './swapMath.js';
 import { startBlockWatcher } from '../lib/blockWatcher.js';
 
 /**
@@ -78,15 +87,27 @@ export async function refreshPosition(position, { autoExit = true } = {}) {
 
   // Partial TP
   if (!exitReason && strat?.partial_tp && !position.partial_tp_done && pnlPercent >= strat.partial_tp_at_percent) {
-    markPartialTpDone(position.id);
     console.log(`[position] ${position.id} partial TP at ${pnlPercent.toFixed(1)}% (${strat.partial_tp_sell_percent}% sell)`);
     if (position.execution_mode === 'live' && position.token_amount_raw) {
       try {
-        const sellAmount = Math.floor(Number(position.token_amount_raw) * (strat.partial_tp_sell_percent / 100));
-        if (sellAmount > 0) {
-          const sell = await executeLiveSell({ ...position, token_amount_raw: String(sellAmount) }, 'PARTIAL_TP');
-          const remaining = Number(position.token_amount_raw) - sellAmount;
-          updateTokenAmount(position.id, remaining);
+        // Matematika BigInt penuh. Number() di sini dulunya merusak saldo
+        // >= 1e21 menjadi notasi eksponensial sehingga BigInt() di
+        // executeLiveSell melempar — partial TP gagal diam-diam.
+        const sellAmount = portionOfRawAmount(position.token_amount_raw, strat.partial_tp_sell_percent);
+        if (sellAmount > 0n) {
+          const sell = await executeLiveSell(
+            { ...position, token_amount_raw: sellAmount.toString() },
+            'PARTIAL_TP'
+          );
+          // Realisasi partial harus masuk PnL final; sebelumnya hasil jual ini
+          // menghilang dari pembukuan sehingga PnL terlihat terlalu rendah.
+          if (sell.outputAmount) addRealizedProceeds(position.id, Number(sell.outputAmount) / 1e18);
+          if (sell.gasCostWei) addPositionGas(position.id, Number(sell.gasCostWei) / 1e18);
+          const remaining = BigInt(position.token_amount_raw) - sellAmount;
+          updateTokenAmount(position.id, remaining.toString());
+          // Baru DI SINI ditandai selesai — dulu ditandai sebelum jual, jadi
+          // satu kegagalan membuat partial TP hangus permanen tanpa retry.
+          markPartialTpDone(position.id);
           recordTrade({
             positionId: position.id,
             mint: position.mint,
@@ -94,15 +115,34 @@ export async function refreshPosition(position, { autoExit = true } = {}) {
             price,
             mcap,
             sizeEth: position.size_eth * (strat.partial_tp_sell_percent / 100),
-            tokenAmountEst: sellAmount,
+            tokenAmountEst: sellAmount.toString(),
             reason: 'PARTIAL_TP',
-            payload: { pnlPercent, sell, partialSellPercent: strat.partial_tp_sell_percent, remaining },
+            payload: {
+              pnlPercent,
+              sell,
+              partialSellPercent: strat.partial_tp_sell_percent,
+              remaining: remaining.toString(),
+            },
           });
+        } else {
+          // Tidak ada yang bisa dijual — tandai selesai agar tidak dicoba tiap tick.
+          markPartialTpDone(position.id);
         }
       } catch (err) {
-        console.log(`[position] ${position.id} partial sell failed: ${err.message}`);
+        // TIDAK ditandai selesai → tick berikutnya mencoba lagi.
+        console.log(`[position] ${position.id} partial sell gagal (akan dicoba lagi): ${err.message}`);
+        await sendTelegram(
+          [
+            `⚠️ <b>Partial TP gagal</b> — posisi #${position.id} ${escapeHtml(position.symbol || '')}`,
+            `PnL ${fmtPct(pnlPercent)} · target jual ${strat.partial_tp_sell_percent}%`,
+            `Error: ${escapeHtml(err.message)}`,
+            '',
+            'Posisi tetap terbuka dan akan dicoba lagi pada tick berikutnya.',
+          ].join('\n')
+        );
       }
     } else {
+      markPartialTpDone(position.id);
       // dry-run partial bookkeeping
       recordTrade({
         positionId: position.id,
@@ -147,11 +187,19 @@ export async function refreshPosition(position, { autoExit = true } = {}) {
     } finally {
       sellInProgress.delete(position.id);
     }
+    // Gas exit dicatat, lalu PnL dihitung NET: hasil jual − modal − gas total.
+    if (sell.gasCostWei) {
+      addPositionGas(position.id, Number(sell.gasCostWei) / 1e18);
+    }
+    const gasEth = positionGasEth(position.id);
+    const realizedEth = realizedProceedsEth(position.id);
+
     const receivedWei = Number(sell.outputAmount || 0);
     const receivedEth = receivedWei > 0 ? receivedWei / 1e18 : null;
     if (receivedEth != null) {
-      finalPnlEth = receivedEth - Number(position.size_eth);
-      finalPnlPercent = (receivedEth / Number(position.size_eth) - 1) * 100;
+      const sizeEth = Number(position.size_eth);
+      finalPnlEth = receivedEth + realizedEth - sizeEth - gasEth;
+      finalPnlPercent = sizeEth > 0 ? (finalPnlEth / sizeEth) * 100 : 0;
     }
 
     closePosition({
@@ -172,7 +220,7 @@ export async function refreshPosition(position, { autoExit = true } = {}) {
       sizeEth: position.size_eth,
       tokenAmountEst: position.token_amount_est,
       reason: exitReason,
-      payload: { pnlPercent: finalPnlPercent, pnlEth: finalPnlEth, receivedEth, sell },
+      payload: { pnlPercent: finalPnlPercent, pnlEth: finalPnlEth, receivedEth, realizedEth, gasEth, sell },
     });
     closed = true;
   } else if (exitReason && autoExit) {
@@ -349,13 +397,19 @@ export async function closePositionManually(selector, { reason = 'MANUAL' } = {}
   if (position.execution_mode === 'live') {
     const sell = await executeLiveSell(position, reason);
     exitSignature = sell.signature;
+    if (sell.gasCostWei) {
+      addPositionGas(position.id, Number(sell.gasCostWei) / 1e18);
+    }
     const wei = Number(sell.outputAmount || 0);
     if (wei > 0) receivedEth = wei / 1e18;
   }
 
-  const finalPnlEth = receivedEth != null ? receivedEth - Number(position.size_eth) : pnlEth;
+  const gasEth = positionGasEth(position.id);
+  const realizedEth = realizedProceedsEth(position.id);
+  const sizeEthNum = Number(position.size_eth);
+  const finalPnlEth = receivedEth != null ? receivedEth + realizedEth - sizeEthNum - gasEth : pnlEth;
   const finalPnlPct =
-    receivedEth != null ? (receivedEth / Number(position.size_eth) - 1) * 100 : pnlPercent;
+    receivedEth != null && sizeEthNum > 0 ? (finalPnlEth / sizeEthNum) * 100 : pnlPercent;
 
   closePosition({
     id: position.id,
@@ -376,7 +430,7 @@ export async function closePositionManually(selector, { reason = 'MANUAL' } = {}
     sizeEth: position.size_eth,
     tokenAmountEst: position.token_amount_est,
     reason,
-    payload: { manual: true, pnlPercent: finalPnlPct, pnlEth: finalPnlEth, receivedEth, exitSignature },
+    payload: { manual: true, pnlPercent: finalPnlPct, pnlEth: finalPnlEth, receivedEth, realizedEth, gasEth, exitSignature },
   });
 
   return {
@@ -389,5 +443,101 @@ export async function closePositionManually(selector, { reason = 'MANUAL' } = {}
       exit_price: price,
       exit_reason: reason,
     },
+  };
+}
+
+/**
+ * Adopsi token yang sudah ada di wallet menjadi posisi terpantau (/adopt).
+ *
+ * Latar: kalau sebuah pembelian sukses on-chain tapi posisinya gagal tercatat,
+ * token itu duduk di wallet TANPA TP/SL — monitor tidak tahu token itu ada.
+ * /adopt menutup celah itu tanpa mengirim transaksi apa pun.
+ *
+ * Saldo dibaca langsung dari chain sebagai BigInt dan disimpan apa adanya
+ * (string uint256) — tidak lewat Number(), yang akan merusak nilai >= 1e21.
+ */
+export async function adoptWalletPosition(mint, { sizeEth = null, entryPriceUsd = null } = {}) {
+  const addr = String(mint || '').toLowerCase();
+  if (!/^0x[0-9a-f]{40}$/.test(addr)) {
+    return { ok: false, error: 'Alamat token tidak valid (harus 0x + 40 hex).' };
+  }
+  if (hasOpenPositionForMint(addr)) {
+    return { ok: false, error: `Sudah ada posisi terbuka #${openPositionIdForMint(addr)} untuk token ini.` };
+  }
+
+  // 1) Saldo nyata on-chain — ini yang menentukan ada/tidaknya sesuatu untuk diadopsi.
+  let balanceRaw;
+  try {
+    balanceRaw = await fetchLiveTokenBalance(addr);
+  } catch (err) {
+    return { ok: false, error: `Gagal baca saldo token: ${err.message}. Pastikan PRIVATE_KEY terpasang.` };
+  }
+  if (!balanceRaw || balanceRaw <= 0n) {
+    return { ok: false, error: 'Saldo token di wallet = 0 — tidak ada yang bisa diadopsi.' };
+  }
+
+  // 2) Harga/metadata pasar (best-effort — token rug sering sudah hilang dari aggregator).
+  let enriched = null;
+  try {
+    enriched = await enrichToken(addr);
+  } catch {
+    /* lanjut tanpa enrichment */
+  }
+  const decimals = Number(enriched?.meta?.decimals) || 18;
+  const tokenAmountEst = Number(balanceRaw) / 10 ** decimals;
+  const marketPrice = Number(enriched?.metrics?.priceUsd) || 0;
+  const entryPrice = Number(entryPriceUsd) > 0 ? Number(entryPriceUsd) : marketPrice;
+  const entryMcap = Number(enriched?.metrics?.marketCapUsd) || 0;
+
+  if (!(entryPrice > 0)) {
+    return {
+      ok: false,
+      error:
+        'Harga token tidak diketahui (tidak ada di DexScreener/GMGN) dan tidak Anda sebutkan. ' +
+        'Ulangi dengan harga entry eksplisit: /adopt <mint> <size_eth> <entry_price_usd>',
+    };
+  }
+
+  const strat = activeStrategy();
+  const size = Number(sizeEth) > 0 ? Number(sizeEth) : Number(strat.position_size_eth) || 0.05;
+
+  // 3) Apakah token ini benar-benar bisa dijual? Adopsi token rug hanya memberi
+  //    rasa aman palsu — laporkan apa adanya (read-only, tanpa transaksi).
+  let sellable = null;
+  let routeNote = '';
+  try {
+    const route = await resolveSwapRoute(addr, null, { allowZeroLiquidity: true });
+    sellable = Boolean(route);
+    routeNote = route
+      ? `rute exit: ${route.kind.toUpperCase()} via ${route.source}`
+      : 'TIDAK ada rute exit — pool V3/V4 tidak ditemukan (kemungkinan LP sudah ditarik / rug).';
+  } catch (err) {
+    sellable = false;
+    routeNote = `cek rute exit gagal: ${err.message}`;
+  }
+
+  const positionId = createAdoptedPosition({
+    mint: addr,
+    symbol: enriched?.meta?.symbol || addr.slice(0, 8),
+    sizeEth: size,
+    entryPrice,
+    entryMcap,
+    tokenAmountRaw: balanceRaw.toString(),
+    tokenAmountEst,
+    strategyId: strat.id,
+    note: `Adopsi manual dari saldo wallet. ${routeNote}`,
+  });
+
+  return {
+    ok: true,
+    positionId,
+    position: positionById(positionId),
+    sellable,
+    routeNote,
+    balanceRaw: balanceRaw.toString(),
+    tokenAmountEst,
+    entryPrice,
+    usedMarketPrice: !(Number(entryPriceUsd) > 0),
+    sizeEth: size,
   };
 }

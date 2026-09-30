@@ -326,6 +326,29 @@ async function ensureWethCoverage(amountWei, reserveWei) {
   return { wrapped: deficit, wethBalance: wethBal + deficit };
 }
 
+/**
+ * Penanganan kegagalan swap yang sadar "sudah tersiar atau belum".
+ *
+ * Aturan emas: begitu transaksi TERSIAR (punya hash), dana sudah bergerak.
+ *   - JANGAN rollback wrap — WETH-nya kemungkinan sudah dipakai swap.
+ *   - Tandai error dengan txHash supaya lapisan atas bisa memberi tahu user
+ *     bahwa dana keluar meski posisi gagal tercatat (butuh rekonsiliasi manual).
+ * Kalau belum tersiar, barulah rollback wrap seperti semula.
+ */
+async function finalizeSwapFailure(err, { wrapped, broadcastHash, venue }) {
+  if (!broadcastHash) {
+    await rollbackWrap(wrapped);
+    return err;
+  }
+  err.txHash = broadcastHash;
+  err.broadcast = true;
+  err.message =
+    `${venue} swap TERSIAR (tx ${broadcastHash}) tapi konfirmasi/pembukuan gagal: ${err.message}. ` +
+    `DANA SUDAH BERGERAK — wrap tidak di-rollback; cek wallet & rekonsiliasi posisi manual.`;
+  console.log(`[live] ⚠️ ${err.message}`);
+  return err;
+}
+
 /** Rollback: kembalikan WETH yang baru di-wrap ke native ETH. Best-effort. */
 async function rollbackWrap(wrappedWei) {
   if (!LIVE_UNWRAP_ON_FAIL || BigInt(wrappedWei) <= 0n) return;
@@ -450,14 +473,15 @@ function filterHooklessPools(pools, meme, seen = new Set()) {
   return out;
 }
 
-async function resolveV4Route(meme, { poolIdHint = null, mintCurrencies = null } = {}) {
+async function resolveV4Route(meme, { poolIdHint = null, mintCurrencies = null, allowZeroLiquidity = false } = {}) {
   // 1) cache dulu — scan log itu mahal
   const cached = filterHooklessPools(cachedV4PoolsForMint(meme), meme);
   if (cached.length) {
     const best = await pickMostLiquidPool(
       publicClient,
       normalizeAddress(UNISWAP_V4_STATE_VIEW),
-      cached
+      cached,
+      { allowZeroLiquidity }
     );
     if (best) {
       return { kind: 'v4', poolId: best.poolId, poolKey: best.poolKey, source: 'cache' };
@@ -481,14 +505,18 @@ async function resolveV4Route(meme, { poolIdHint = null, mintCurrencies = null }
     supported.push(entry);
   }
   if (!supported.length) return null;
-  const best = await pickMostLiquidPool(publicClient, normalizeAddress(UNISWAP_V4_STATE_VIEW), supported);
+  const best = await pickMostLiquidPool(publicClient, normalizeAddress(UNISWAP_V4_STATE_VIEW), supported, {
+    allowZeroLiquidity,
+  });
   if (!best) return null;
   return { kind: 'v4', poolId: best.poolId, poolKey: best.poolKey, source: poolIdHint ? 'dex' : 'logs', liquidity: best.liquidity };
 }
 
-async function resolveV3Route(meme, { pairHint = null } = {}) {
+async function resolveV3Route(meme, { pairHint = null, allowZeroLiquidity = false } = {}) {
   const factory = normalizeAddress(UNISWAP_V3_FACTORY);
   const weth = normalizeAddress(WETH_ADDRESS);
+  // Pool yang ADA tapi likuiditas tick-aktifnya 0 — cadangan untuk jalur JUAL.
+  let zeroLiqFallback = null;
 
   const tiers = [...FEE_TIERS];
   if (pairHint?.fee != null && !tiers.includes(pairHint.fee)) tiers.unshift(pairHint.fee);
@@ -522,8 +550,13 @@ async function resolveV3Route(meme, { pairHint = null } = {}) {
     if (liquidity > 0n) {
       return { kind: 'v3', fee, pool: normalizeAddress(pool), liquidity, source: pairHint ? 'dex+factory' : 'factory' };
     }
+    if (!zeroLiqFallback) {
+      zeroLiqFallback = { kind: 'v3', fee, pool: normalizeAddress(pool), liquidity, source: 'factory_zero_liq' };
+    }
   }
-  return null;
+  // Untuk JUAL: pool yang ada tapi tick-aktifnya kosong tetap layak dicoba —
+  // simulasi on-chain yang memutuskan, bukan heuristik likuiditas.
+  return allowZeroLiquidity ? zeroLiqFallback : null;
 }
 
 /**
@@ -533,13 +566,13 @@ async function resolveV3Route(meme, { pairHint = null } = {}) {
  *   3. scan factory V3 (cepat, 4 eth_call)
  *   4. scan log Initialize V4 (mahal, ter-cache setelahnya)
  */
-export async function resolveSwapRoute(meme, dexPair = null) {
+export async function resolveSwapRoute(meme, dexPair = null, { allowZeroLiquidity = false } = {}) {
   if (!/^0x[0-9a-fA-F]{40}$/.test(meme)) throw new Error(`Invalid meme token address: ${meme}`);
   const hint = dexPair || (await fetchDexPairHint(meme));
   const hintKind = routeKindFromDexPair(hint);
 
   if (LIVE_V4_ENABLED && (hintKind === 'v4' || looksLikeV4PoolId(hint?.pairAddress))) {
-    const route = await resolveV4Route(meme, { poolIdHint: hint?.pairAddress });
+    const route = await resolveV4Route(meme, { poolIdHint: hint?.pairAddress, allowZeroLiquidity });
     if (route) return route;
     console.log('[route] dex v4 hint tapi pool tidak ketemu on-chain — fallback');
   }
@@ -557,21 +590,21 @@ export async function resolveSwapRoute(meme, dexPair = null) {
     } catch {
       /* bukan pool V3 valid */
     }
-    const route = await resolveV3Route(meme, { pairHint: fee != null ? { fee } : null });
+    const route = await resolveV3Route(meme, { pairHint: fee != null ? { fee } : null, allowZeroLiquidity });
     if (route) return route;
   }
 
   if (LIVE_V4_ENABLED) {
-    const cached = await resolveV4Route(meme, {});
+    const cached = await resolveV4Route(meme, { allowZeroLiquidity });
     if (cached) return cached;
   }
 
-  const v3 = await resolveV3Route(meme, {});
+  const v3 = await resolveV3Route(meme, { allowZeroLiquidity });
   if (v3) return v3;
 
   if (LIVE_V4_ENABLED) {
     // scan semua pool yang memuat meme (quote ETH native maupun WETH)
-    const v4 = await resolveV4Route(meme, { mintCurrencies: [meme, null] });
+    const v4 = await resolveV4Route(meme, { mintCurrencies: [meme, null], allowZeroLiquidity });
     if (v4) return v4;
   }
 
@@ -641,6 +674,7 @@ async function executeSwapV4({ poolKey, amountIn, isNativeIn, memeToken, deadlin
   });
 
   let wrapped = 0n;
+  let broadcastHash = null;
   try {
     // 2) Side effect HANYA setelah quote valid: wrap deficit + approval.
     if (isNativeIn && currencyIn === weth) {
@@ -680,8 +714,17 @@ async function executeSwapV4({ poolKey, amountIn, isNativeIn, memeToken, deadlin
       ? 0n
       : await fetchLiveTokenBalance(memeToken);
 
-    const hash = walletClient.writeContract({ ...request, account });
+    // ⚠️ WAJIB await — tanpa ini `hash` adalah Promise, transaksi tetap TERSIAR
+    // tapi waitForTransactionReceipt menunggu hash "[object Promise]" sampai
+    // timeout 180 s lalu melempar. Akibatnya: dana keluar, posisi TIDAK pernah
+    // tercatat, tidak ada TP/SL, dan wrap ikut di-rollback keliru.
+    const hash = await walletClient.writeContract({ ...request, account });
+    // Sejak titik ini dana SUDAH bergerak on-chain.
+    broadcastHash = hash;
     const receipt = await publicClient.waitForTransactionReceipt({ hash });
+
+    // Gas selalu dihitung — PnL yang mengabaikannya optimistis secara sistematis.
+    const gasCost = BigInt(receipt.gasUsed || 0) * BigInt(receipt.effectiveGasPrice || 0);
 
     let received;
     if (isNativeIn) {
@@ -690,7 +733,6 @@ async function executeSwapV4({ poolKey, amountIn, isNativeIn, memeToken, deadlin
       if (received <= 0n) received = quote.amountOut;
     } else {
       const afterNative = await publicClient.getBalance({ address: account.address });
-      const gasCost = BigInt(receipt.gasUsed) * BigInt(receipt.effectiveGasPrice || 0);
       received = afterNative - beforeNative + gasCost + value;
       if (received <= 0n) received = quote.amountOut;
     }
@@ -704,10 +746,10 @@ async function executeSwapV4({ poolKey, amountIn, isNativeIn, memeToken, deadlin
       poolId: poolIdFromKey(poolKey),
       chainId: CHAIN_ID,
       status: receipt.status,
+      gasCostWei: gasCost.toString(),
     };
   } catch (err) {
-    await rollbackWrap(wrapped);
-    throw err;
+    throw await finalizeSwapFailure(err, { wrapped, broadcastHash, venue: 'V4' });
   }
 }
 
@@ -725,6 +767,7 @@ async function executeSwapV3({ route, amountIn, isNativeIn, memeToken, deadline 
   const tokenOut = isNativeIn ? normalizeAddress(memeToken) : weth;
 
   let wrapped = 0n;
+  let broadcastHash = null;
   try {
     if (isNativeIn) {
       const cov = await ensureWethCoverage(amountInBI, parseEther(String(LIVE_MIN_ETH_RESERVE)));
@@ -777,8 +820,13 @@ async function executeSwapV3({ route, amountIn, isNativeIn, memeToken, deadline 
     const beforeToken = isNativeIn ? await fetchLiveTokenBalance(memeToken) : 0n;
     const beforeWeth = !isNativeIn ? await wethBalance(account.address) : 0n;
 
-    const hash = walletClient.writeContract({ ...request, account });
+    // ⚠️ WAJIB await — lihat catatan identik di executeSwapV4.
+    const hash = await walletClient.writeContract({ ...request, account });
+    // Sejak titik ini dana SUDAH bergerak on-chain.
+    broadcastHash = hash;
     const receipt = await publicClient.waitForTransactionReceipt({ hash });
+
+    const gasCost = BigInt(receipt.gasUsed || 0) * BigInt(receipt.effectiveGasPrice || 0);
 
     let received;
     if (isNativeIn) {
@@ -811,10 +859,10 @@ async function executeSwapV3({ route, amountIn, isNativeIn, memeToken, deadline 
       pool: route.pool,
       chainId: CHAIN_ID,
       status: receipt.status,
+      gasCostWei: gasCost.toString(),
     };
   } catch (err) {
-    await rollbackWrap(wrapped);
-    throw err;
+    throw await finalizeSwapFailure(err, { wrapped, broadcastHash, venue: 'V3' });
   }
 }
 
@@ -847,8 +895,7 @@ export async function revokeApproval(token, spender) {
  * Native ETH sentinel = 0x000…0000 / null.
  * Otomatis memilih venue terbaik (V4 native-ETH, V4 WETH, atau V3).
  */
-export async function executeJupiterSwap({ inputMint, outputMint, amount, dexPair = null, route = null }) {
-  // Name kept similar to Charon (it was Jupiter on Solana); this is Uniswap on RH Chain.
+export async function executeSwap({ inputMint, outputMint, amount, dexPair = null, route = null }) {
   ensureWallet();
   const amountIn = BigInt(amount);
   const isNativeIn = isNativeSentinel(inputMint);
@@ -857,14 +904,19 @@ export async function executeJupiterSwap({ inputMint, outputMint, amount, dexPai
     throw new Error(`Swap harus melibatkan tepat satu sisi native ETH (in=${inputMint}, out=${outputMint})`);
   }
   const memeToken = normalizeAddress(isNativeIn ? outputMint : inputMint);
-  const coolLeft = mintCooldownLeft(memeToken);
-  if (coolLeft > 0) {
-    throw new Error(
-      `${memeToken.slice(0, 12)}… sedang cooldown eksekusi (${Math.ceil(coolLeft / 60000)} menit lagi) — ` +
-        `gagal struktural sebelumnya; dilewati demi keamanan`
-    );
-  }
+  // Cooldown kegagalan HANYA memblok BELI. Sebelumnya gate ini juga mengenai
+  // JUAL: satu quote jual yang gagal memanggil blockMint(), lalu 30 menit
+  // berikutnya setiap percobaan exit ditolak mentah-mentah tanpa menyentuh
+  // chain — posisi terkunci justru saat harga jatuh. Exit harus selalu boleh
+  // dicoba ulang (prinsip yang sama sudah dipakai routelessCooldown).
   if (isNativeIn) {
+    const coolLeft = mintCooldownLeft(memeToken);
+    if (coolLeft > 0) {
+      throw new Error(
+        `${memeToken.slice(0, 12)}… sedang cooldown eksekusi (${Math.ceil(coolLeft / 60000)} menit lagi) — ` +
+          `gagal struktural sebelumnya; dilewati demi keamanan`
+      );
+    }
     const rlLeft = routelessCooldownLeft(memeToken);
     if (rlLeft > 0) {
       throw new Error(
@@ -875,7 +927,9 @@ export async function executeJupiterSwap({ inputMint, outputMint, amount, dexPai
   }
   const deadline = Math.floor(Date.now() / 1000) + SWAP_DEADLINE_SECONDS;
 
-  const resolved = route || (await resolveSwapRoute(memeToken, dexPair));
+  // JUAL: jangan biarkan heuristik likuiditas tick-aktif memveto rute exit.
+  const resolved =
+    route || (await resolveSwapRoute(memeToken, dexPair, { allowZeroLiquidity: !isNativeIn }));
   if (!resolved) {
     // Cooldown HANYA untuk beli — jangan rescan ~5 juta blok untuk token tanpa
     // route setiap siklus (kasus #48/#52: VRAX/CC dipindai berulang-ulang).

@@ -10,6 +10,7 @@
  * Jika test ini lulus, encoding kita kompatibel persis dengan router on-chain.
  */
 import { strict as assert } from 'node:assert';
+import { readFileSync } from 'node:fs';
 import { decodeFunctionData } from 'viem';
 import {
   buildV4SwapInput,
@@ -27,6 +28,8 @@ import {
   minOutWithSlippage,
   wrapDeficit,
   reserveVerdict,
+  portionOfRawAmount,
+  toRawAmountString,
 } from '../src/execution/swapMath.js';
 
 let passed = 0;
@@ -297,6 +300,175 @@ await okAsync('getLogsChunked: error non-limit dilempar ulang', async () => {
     threw = /network unreachable/.test(String(err.message));
   }
   assert.equal(threw, true);
+});
+
+// ─── Regresi: setiap pengiriman transaksi WAJIB di-await ─────────────────────
+// Insiden nyata: `const hash = walletClient.writeContract(...)` tanpa await →
+// tx TETAP tersiar (dompet menunjukkan pembelian) tapi `hash` adalah Promise,
+// waitForTransactionReceipt menunggu "[object Promise]" sampai timeout 180 s,
+// lalu melempar. Hasilnya: dana keluar, posisi tidak pernah tercatat, tidak ada
+// TP/SL, dan wrap ikut di-rollback keliru.
+ok('setiap writeContract/sendTransaction di-await (regresi tx-hilang)', () => {
+  const src = readFileSync(new URL('../src/liveExecutor.js', import.meta.url), 'utf8');
+  const offenders = src
+    .split('\n')
+    .map((line, i) => ({ line: line.trim(), no: i + 1 }))
+    .filter(
+      ({ line }) =>
+        /\b(writeContract|sendTransaction)\s*\(/.test(line) &&
+        !/simulateContract/.test(line) &&
+        !/\bawait\b/.test(line) &&
+        !line.startsWith('*') &&
+        !line.startsWith('//')
+    );
+  assert.equal(
+    offenders.length,
+    0,
+    `pengiriman tx tanpa await di liveExecutor.js: ${offenders.map((o) => `baris ${o.no}`).join(', ')}`
+  );
+});
+
+ok('kegagalan setelah tx tersiar tidak me-rollback wrap', () => {
+  const src = readFileSync(new URL('../src/liveExecutor.js', import.meta.url), 'utf8');
+  // Kedua venue harus lewat finalizeSwapFailure, bukan rollbackWrap langsung.
+  assert.equal(
+    (src.match(/throw await finalizeSwapFailure\(/g) || []).length,
+    2,
+    'executeSwapV4 dan executeSwapV3 harus memakai finalizeSwapFailure'
+  );
+  assert.ok(/err\.broadcast = true/.test(src), 'error harus ditandai broadcast agar bisa direkonsiliasi');
+});
+
+// ─── Regresi: jalur JUAL tidak boleh diveto heuristik likuiditas ─────────────
+// getLiquidity = likuiditas pada tick AKTIF saja. Memecoin yang harganya jatuh
+// keluar dari range LP melaporkan 0 padahal pool masih bisa di-swap dengan
+// melintasi tick. Memveto rute atas dasar ini mengunci posisi → "token tidak
+// bisa dijual, tidak ada pair aktif".
+await okAsync('pickMostLiquidPool: allowZeroLiquidity menyelamatkan rute EXIT', async () => {
+  const pools = [
+    { poolId: '0xaaaa', poolKey: { fee: 3000 } },
+    { poolId: '0xbbbb', poolKey: { fee: 10000 } },
+  ];
+  const fakeClient = {
+    async readContract() {
+      return 0n; // semua tick-aktif kosong, tapi pool DIKENAL PoolManager
+    },
+  };
+  const sv = '0x' + '2'.repeat(40);
+
+  // Beli (default): tetap ditolak — perilaku lama dipertahankan.
+  assert.equal(await pickMostLiquidPool(fakeClient, sv, pools), null);
+
+  // Jual: harus dapat kandidat supaya quoter yang memutuskan.
+  const exit = await pickMostLiquidPool(fakeClient, sv, pools, { allowZeroLiquidity: true });
+  assert.ok(exit, 'jalur exit harus tetap mendapat pool kandidat');
+  assert.equal(exit.poolId, '0xaaaa');
+  assert.equal(exit.liquidity, 0n);
+});
+
+await okAsync('pickMostLiquidPool: pool HANTU (getLiquidity revert) tetap ditolak saat exit', async () => {
+  const pools = [{ poolId: '0xdead', poolKey: {} }];
+  const fakeClient = {
+    async readContract() {
+      throw new Error('execution reverted'); // bukan pool PoolManager ini
+    },
+  };
+  const exit = await pickMostLiquidPool(fakeClient, '0x' + '2'.repeat(40), pools, { allowZeroLiquidity: true });
+  assert.equal(exit, null, 'pool hantu tidak boleh dipakai walau untuk exit');
+});
+
+ok('cooldown kegagalan hanya memblok BELI, tidak memblok JUAL', () => {
+  const src = readFileSync(new URL('../src/liveExecutor.js', import.meta.url), 'utf8');
+  const body = src.slice(src.indexOf('export async function executeSwap'));
+  const guard = body.slice(0, body.indexOf('const deadline'));
+  const coolIdx = guard.indexOf('mintCooldownLeft(memeToken)');
+  const buyOnlyIdx = guard.indexOf('if (isNativeIn)');
+  assert.ok(coolIdx > -1 && buyOnlyIdx > -1, 'gate cooldown harus ada');
+  assert.ok(
+    buyOnlyIdx < coolIdx,
+    'mintCooldownLeft harus berada DI DALAM cabang isNativeIn (beli) — exit wajib selalu boleh dicoba'
+  );
+});
+
+ok('resolveSwapRoute melonggarkan gate likuiditas khusus untuk jual', () => {
+  const src = readFileSync(new URL('../src/liveExecutor.js', import.meta.url), 'utf8');
+  assert.ok(
+    /resolveSwapRoute\(memeToken, dexPair, \{ allowZeroLiquidity: !isNativeIn \}\)/.test(src),
+    'executeSwap harus meneruskan allowZeroLiquidity untuk sisi jual'
+  );
+});
+
+// ─── Regresi K-1: presisi uint256 pada partial TP ────────────────────────────
+// Saldo memecoin 18-desimal rutin melewati 2^53 dan >= 1e21. Jalur lama
+// `Math.floor(Number(raw) * pct)` + `String()` menghasilkan "2.5e+24", yang
+// membuat BigInt() di executeLiveSell melempar → partial TP gagal diam-diam.
+ok('portionOfRawAmount: BigInt penuh, tanpa notasi eksponensial', () => {
+  const raw = '5000000000000000000000000'; // 5 juta token @18 desimal = 5e24
+
+  // Kontrol: jalur LAMA memang rusak untuk nilai ini.
+  const legacy = String(Math.floor(Number(raw) * 0.5));
+  assert.match(legacy, /e\+/i, 'kontrol: jalur lama menghasilkan eksponensial');
+  assert.throws(() => BigInt(legacy), 'kontrol: BigInt() melempar pada hasil lama');
+
+  // Jalur baru.
+  const half = portionOfRawAmount(raw, 50);
+  assert.equal(half, 2500000000000000000000000n, 'separuh tepat, tanpa kehilangan presisi');
+  assert.doesNotMatch(half.toString(), /e\+/i, 'tidak ada notasi eksponensial');
+  assert.equal(BigInt(half.toString()), half, 'bisa di-parse ulang oleh BigInt');
+});
+
+ok('portionOfRawAmount: floor, persen pecahan, dan batas aman', () => {
+  assert.equal(portionOfRawAmount('100', 12.5), 12n, 'persen pecahan akurat + floor');
+  assert.equal(portionOfRawAmount('7', 50), 3n, 'floor: jangan pernah jual lebih dari yang dimiliki');
+  assert.equal(portionOfRawAmount('1000', 100), 1000n, '100% = seluruhnya');
+  assert.equal(portionOfRawAmount('1000', 150), 1000n, '>100% dibatasi ke seluruhnya');
+  assert.equal(portionOfRawAmount('1000', 0), 0n, '0% = nol');
+  assert.equal(portionOfRawAmount('0', 50), 0n, 'saldo nol aman');
+
+  // Sisa + terjual harus selalu = total (tidak boleh ada token menguap).
+  const raw = 123456789012345678901234567n;
+  const sell = portionOfRawAmount(raw, 37);
+  assert.ok(sell + (raw - sell) === raw, 'sisa + terjual = total');
+});
+
+ok('toRawAmountString: estimasi besar tetap string desimal valid', () => {
+  // Kontraknya BUKAN presisi sempurna — inputnya float hasil estimasi, jadi
+  // kehilangan presisi di luar ~17 digit signifikan memang melekat. Yang
+  // dijamin: hasilnya SELALU string desimal yang bisa di-BigInt(), tidak
+  // pernah notasi eksponensial. Itulah yang dulu merusak jalur jual.
+  const out = toRawAmountString(5_000_000);
+  assert.doesNotMatch(out, /e\+/i, '5 juta token tidak jadi eksponensial');
+  assert.doesNotThrow(() => BigInt(out), 'selalu bisa di-parse BigInt');
+
+  // Akurat dalam toleransi float (relatif < 1e-12).
+  const got = BigInt(out);
+  const want = 5000000000000000000000000n;
+  const drift = got > want ? got - want : want - got;
+  assert.ok(drift * 1_000_000_000_000n < want, `drift float dapat diabaikan (${drift})`);
+
+  // Kontrol: jalur lama pada nilai yang sama memang menghasilkan eksponensial.
+  assert.match(String(Math.floor(5_000_000 * 1e18)), /e\+/i, 'kontrol: jalur lama rusak');
+
+  assert.equal(toRawAmountString(0), '0');
+  assert.equal(toRawAmountString(-5), '0', 'negatif ditolak');
+  assert.equal(toRawAmountString(Infinity), '0', 'Infinity ditolak');
+  assert.equal(toRawAmountString(NaN), '0', 'NaN ditolak');
+});
+
+ok('partial TP: markPartialTpDone hanya SETELAH jual berhasil', () => {
+  const src = readFileSync(new URL('../src/execution/positions.js', import.meta.url), 'utf8');
+  const block = src.slice(src.indexOf('// Partial TP'), src.indexOf('// Standard exits'));
+  const sellIdx = block.indexOf('await executeLiveSell');
+  const markIdx = block.indexOf('markPartialTpDone', sellIdx);
+  assert.ok(sellIdx > -1, 'blok partial TP harus memanggil executeLiveSell');
+  assert.ok(markIdx > sellIdx, 'markPartialTpDone harus SETELAH jual — kegagalan wajib bisa retry');
+  // Tidak boleh ada Number() pada token_amount_raw di blok ini.
+  assert.doesNotMatch(
+    block,
+    /Number\(\s*position\.token_amount_raw/,
+    'token_amount_raw tidak boleh lewat Number()'
+  );
+  assert.match(block, /portionOfRawAmount\(/, 'harus memakai helper BigInt');
 });
 
 console.log(`\n✓ smoke-executor PASSED (${passed} tests)`);

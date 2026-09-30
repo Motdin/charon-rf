@@ -115,7 +115,7 @@ export async function generateLessons(trades) {
   }
 
   const system = [
-    'You are Charon-RH learning engine for a Solana-style trench agent on Robinhood Chain.',
+    'You are Charon-RH learning engine for an EVM trench agent on Robinhood Chain.',
     'You receive closed dry-run/live trades and must extract reusable LESSONS.',
     'Return strict JSON only: {"lessons":[{"lesson":"string","evidence":"string","severity":"low|medium|high"}]}',
     'Rules:',

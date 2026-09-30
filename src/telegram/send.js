@@ -1,4 +1,4 @@
-import { TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, APP_NAME, GMGN_ENABLED, GMGN_API_KEY } from '../config.js';
+import { TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_ALLOWED_USER_IDS, APP_NAME, GMGN_ENABLED, GMGN_API_KEY } from '../config.js';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { existsSync, mkdirSync, unlinkSync } from 'node:fs';
@@ -11,7 +11,7 @@ import { activeStrategy, allStrategies, strategyById, setActiveStrategy, updateS
 import { candidateSummary, positionSummary } from './format.js';
 import { escapeHtml, fmtEth, fmtPct, fmtUsd, short, now } from '../utils.js';
 import { executeConfirmedIntent, rejectIntent } from '../execution/router.js';
-import { closePositionManually } from '../execution/positions.js';
+import { closePositionManually, adoptWalletPosition } from '../execution/positions.js';
 import { gmgnWeightStatus } from '../enrichment/gmgn.js';
 import { llmStatus } from '../pipeline/llm.js';
 import { addSavedWallet, removeSavedWallet, listSavedWallets } from '../enrichment/wallets.js';
@@ -47,6 +47,19 @@ import {
 
 let bot = null;
 let sendImpl = null;
+
+/**
+ * Otorisasi dua lapis: chat yang benar DAN (bila di-allowlist) user yang benar.
+ *
+ * Cek chat.id saja tidak cukup untuk TELEGRAM_CHAT_ID yang menunjuk grup —
+ * setiap anggota grup akan bisa memanggil /mode live, /confirm, /close.
+ * Kosongkan TELEGRAM_ALLOWED_USER_IDS untuk mempertahankan perilaku lama.
+ */
+export function isAuthorized({ chatId, userId }) {
+  if (String(chatId) !== String(TELEGRAM_CHAT_ID)) return false;
+  if (!TELEGRAM_ALLOWED_USER_IDS.length) return true;
+  return TELEGRAM_ALLOWED_USER_IDS.includes(String(userId));
+}
 
 export function getBot() {
   return bot;
@@ -143,6 +156,7 @@ function helpText() {
     '/stratset &lt;id&gt; &lt;key&gt; &lt;value&gt; — hot-edit strategy param',
     '/positions — open + recent closed',
     '/close <id|symbol|CA> — manual close position',
+    '/adopt <mint> [size_eth] [entry_usd] — track a token already in the wallet',
     '/pnl — simple PnL summary',
     '/pnlcard [YYYY-MM-DD] — shareable daily PnL card (PNG for X)',
     '/pnlcard text [YYYY-MM-DD] — text card ready to copy to X',
@@ -381,7 +395,12 @@ export function startTelegramBot() {
     bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
 
     bot.on('message', async (msg) => {
-      if (String(msg.chat.id) !== String(TELEGRAM_CHAT_ID)) return;
+      if (!isAuthorized({ chatId: msg.chat?.id, userId: msg.from?.id })) {
+        if (String(msg.chat?.id) === String(TELEGRAM_CHAT_ID)) {
+          console.log(`[tg] perintah ditolak dari user ${msg.from?.id} (tidak di TELEGRAM_ALLOWED_USER_IDS)`);
+        }
+        return;
+      }
       const text = (msg.text || '').trim();
       if (!text) return;
 
@@ -544,6 +563,63 @@ export function startTelegramBot() {
               await sendTelegram(`✅ <b>Posisi #${res.position.id} ditutup manual</b>\n\n${positionSummary(res.position)}`);
             } catch (err) {
               await sendTelegram(`❌ close gagal: ${escapeHtml(err.message)}`, { parse_mode: 'HTML' });
+            }
+            break;
+          }
+
+          case '/adopt': {
+            const mint = (args[0] || '').trim();
+            if (!mint) {
+              await sendTelegram(
+                [
+                  'Usage: <code>/adopt &lt;mint&gt; [size_eth] [entry_price_usd]</code>',
+                  '',
+                  'Angkat token yang SUDAH ada di wallet menjadi posisi terpantau',
+                  '(TP/SL/trailing aktif). Tidak mengirim transaksi apa pun.',
+                  '',
+                  'Untuk token yang pembeliannya sukses on-chain tapi posisinya',
+                  'tidak tercatat, atau pembelian manual di luar bot.',
+                  '',
+                  '<code>size_eth</code> = modal yang dipakai (basis PnL). Default: ukuran posisi strategi aktif.',
+                  '<code>entry_price_usd</code> = harga beli sebenarnya. Default: harga pasar saat ini.',
+                ].join('\n')
+              );
+              break;
+            }
+            await sendTelegram(`⏳ Mengadopsi <code>${escapeHtml(mint)}</code>…`);
+            try {
+              const res = await adoptWalletPosition(mint, {
+                sizeEth: args[1] ? Number(args[1]) : null,
+                entryPriceUsd: args[2] ? Number(args[2]) : null,
+              });
+              if (!res.ok) {
+                await sendTelegram(`❌ ${escapeHtml(res.error)}`);
+                break;
+              }
+              const lines = [
+                `✅ <b>Posisi #${res.positionId} diadopsi</b>`,
+                '',
+                positionSummary(res.position),
+                '',
+                `Saldo on-chain: <code>${escapeHtml(res.balanceRaw)}</code> raw (~${res.tokenAmountEst.toLocaleString()})`,
+                `Basis: ${fmtEth(res.sizeEth)} @ $${res.entryPrice}`,
+              ];
+              if (res.usedMarketPrice) {
+                lines.push(
+                  '⚠️ Entry memakai <b>harga pasar saat ini</b>, bukan harga beli Anda.',
+                  'PnL dihitung dari titik ini. Ulangi dengan harga eksplisit bila perlu.'
+                );
+              }
+              lines.push('', res.sellable ? `🟢 ${escapeHtml(res.routeNote)}` : `🔴 ${escapeHtml(res.routeNote)}`);
+              if (!res.sellable) {
+                lines.push(
+                  'Posisi tetap dicatat agar terlihat di /positions,',
+                  'tapi exit otomatis TIDAK akan berhasil selama rute tidak ada.'
+                );
+              }
+              await sendTelegram(lines.join('\n'));
+            } catch (err) {
+              await sendTelegram(`❌ adopt gagal: ${escapeHtml(err.message)}`);
             }
             break;
           }
@@ -769,7 +845,14 @@ export function startTelegramBot() {
     });
 
     bot.on('callback_query', async (query) => {
-      if (String(query.message?.chat?.id) !== String(TELEGRAM_CHAT_ID)) return;
+      if (!isAuthorized({ chatId: query.message?.chat?.id, userId: query.from?.id })) {
+        try {
+          await bot.answerCallbackQuery(query.id, { text: 'Tidak diizinkan.', show_alert: true });
+        } catch {
+          /* ignore */
+        }
+        return;
+      }
       const data = query.data || '';
       const chatId = query.message.chat.id;
       try {
