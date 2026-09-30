@@ -199,10 +199,16 @@ export async function findV4Pools(client, poolManager, { poolIdHint = null, curr
   return [];
 }
 
-/** Pilih pool dengan likuiditas terbesar via StateView.getLiquidity. */
+/**
+ * Pilih pool dengan likuiditas TERBESAR via StateView.getLiquidity.
+ * Pool tanpa likuiditas aktif (liq = 0: baru di-initialize, pair kembar
+ * lintas PoolManager, atau LP sudah ditarik) DITOLAK — menukar di pool
+ * zero-liq hanya menghasilkan quoter revert (UnexpectedRevertBytes) dan
+ * nyata terjadi live (token 0x9e7a…c86, pool 0x1057c266…c2307).
+ */
 export async function pickMostLiquidPool(client, stateView, pools) {
   let best = null;
-  let bestLiq = -1n;
+  let bestLiq = 0n; // sentinel 0, bukan -1: pool zero-liquidity tak pernah menang
   for (const entry of pools || []) {
     let liq = 0n;
     try {
@@ -222,6 +228,65 @@ export async function pickMostLiquidPool(client, stateView, pools) {
     }
   }
   return best;
+}
+
+// ─── Klasifikasi kegagalan (pesan ramah untuk Telegram) ───────────────────────
+
+/**
+ * Selector revert yang relevan di jalur V4 (diverifikasi on-chain 2026-09-30):
+ *   0x6190b2b0 UnexpectedRevertBytes(bytes) — QuoterRevert membungkus revert
+ *     asli PoolManager (pool kelihatan di log tapi tidak bisa di-swap:
+ *     tidak ter-inisialisasi di PM ini / nol likuiditas / venue lain).
+ *   0x486aa307 PoolNotInitialized()
+ *   0x9f65e7f8 V4TooLittleReceived() — output < minOut (harga bergerak)
+ *   0xbe8b8507 V4TooMuchRequested() — settle melampaui batas
+ *   0x2c4029e9 ExecutionFailed(uint256,bytes) — sub-perintah UR gagal
+ */
+const V4_REVERT_TABLE = [
+  ['0x6190b2b0', 'UnexpectedRevertBytes', 'pool tak bisa di-swap di PoolManager ini (belum di-initialize di sini / tanpa likuiditas / pool kembar venue lain)'],
+  ['0x486aa307', 'PoolNotInitialized', 'pool belum ter-initialize di PoolManager official — poolId ini hidup di venue lain'],
+  ['0x9f65e7f8', 'V4TooLittleReceived', 'output di bawah minOut — harga bergerak saat eksekusi (slippage), coba lagi'],
+  ['0xbe8b8507', 'V4TooMuchRequested', 'settle melebihi batas input — rute bermasalah'],
+  ['0x2c4029e9', 'ExecutionFailed', 'sub-perintah Universal Router gagal'],
+];
+
+function collectErrorText(err) {
+  const parts = [];
+  let cur = err;
+  let depth = 0;
+  while (cur && depth < 6) {
+    for (const key of ['shortMessage', 'data', 'message']) {
+      if (cur[key]) parts.push(String(cur[key]));
+    }
+    if (Array.isArray(cur.metaMessages)) parts.push(...cur.metaMessages.map(String));
+    cur = cur.cause;
+    depth++;
+  }
+  return parts.join(' ');
+}
+
+/**
+ * Ubah error viem yang bertele-tele menjadi ringkasan 1 baris.
+ * Return: { raw: 'empty'|'selector'|'unknown', code, summary }
+ */
+export function classifyV4Failure(err) {
+  const text = collectErrorText(err);
+  const selectors = text.match(/0x[0-9a-fA-F]{8}\b/g) || [];
+  for (const [sig, code, hint] of V4_REVERT_TABLE) {
+    const found = selectors.find((s) => s.toLowerCase() === sig);
+    if (found) return { raw: 'selector', code: found, summary: `${code} — ${hint}` };
+  }
+  // revert polos tanpa data (require tanpa reason: gate transfer token, settle gagal, dll)
+  if (/execution reverted/i.test(text) && !selectors.length) {
+    return {
+      raw: 'empty',
+      code: null,
+      summary:
+        'revert tanpa reason — umumnya token membatasi transfer pool ini (gate/hook) atau settle WETH gagal; mint dilewati sementara',
+    };
+  }
+  const firstLine = String(err?.shortMessage || err?.message || err).split('\n')[0].slice(0, 180);
+  return { raw: 'unknown', code: null, summary: firstLine || 'kesalahan tidak dikenal' };
 }
 
 /**
