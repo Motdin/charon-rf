@@ -1,5 +1,5 @@
 import { encodeAbiParameters, concatHex, keccak256, parseAbi, parseAbiItem } from 'viem';
-import { V4_DEPLOY_BLOCK, LOG_SCAN_CHUNK_BLOCKS } from '../config.js';
+import { V4_DEPLOY_BLOCK, LOG_SCAN_CHUNK_BLOCKS, LOG_SCAN_PACE_MS } from '../config.js';
 import { sleep } from '../utils.js';
 
 /**
@@ -204,6 +204,9 @@ export async function getLogsChunked(client, params, { deployBlock = V4_DEPLOY_B
       out.push(...part);
       from = to + 1n;
       retries429 = 0;
+      if (from <= latest && LOG_SCAN_PACE_MS > 0) {
+        await sleep(LOG_SCAN_PACE_MS);
+      }
     } catch (err) {
       const text = String(err?.message || err?.shortMessage || err?.details || '');
       if (/\b429\b|too many requests|rate.?limit/i.test(text) && retries429 < 5) {
