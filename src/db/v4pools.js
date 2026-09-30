@@ -46,6 +46,14 @@ export function cacheV4Pool(mint, poolId, poolKey, source = 'logs') {
   );
 }
 
+/** Buang pool dari cache (quoter bilang pool ini tak bisa di-swap di PM official). */
+export function evictV4Pool(poolId) {
+  ensureTable();
+  return db
+    .prepare('DELETE FROM v4_pools WHERE pool_id = ?')
+    .run(String(poolId).toLowerCase()).changes;
+}
+
 export function cachedV4PoolsForMint(mint) {
   ensureTable();
   const rows = db
