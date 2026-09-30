@@ -78,6 +78,7 @@ export async function decideCandidateBatch(rows, triggerCandidateId) {
     'Use PASS if the set is weak or unsafe.',
     'Prefer candidates with multiple overlapping signals (volume spike + new pool + on-chain activity).',
     'Penalize high rug scores, thin liquidity, and extreme holder concentration.',
+    "The 'anomalies' field lists manipulation signatures (wash volume, hidden holder concentration/sybil) — treat ANY anomaly as a strong reason to PASS, because volume spikes manufactured by wash trading are the most common trap on this chain.",
     'Chart-style price changes are context only — large 24h moves are normal for new meme tokens.',
     'Use pool age and distance from recent highs to judge whether entry is late.',
     'Confidence is your conviction from 0 to 100, not probability.',

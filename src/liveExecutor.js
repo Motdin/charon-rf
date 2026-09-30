@@ -29,7 +29,7 @@ import {
   CHAIN_ID,
   NATIVE_ETH,
 } from './config.js';
-import { normalizeAddress } from './utils.js';
+import { normalizeAddress, pruneSeen } from './utils.js';
 import { publicClient } from './lib/rpc.js';
 import {
   buildV4SwapInput,
@@ -113,6 +113,8 @@ const MINT_FAIL_COOLDOWN_MS = Number(process.env.LIVE_MINT_FAIL_COOLDOWN_MS || 3
 const mintFailCooldown = new Map(); // mint → lastFailMs
 
 function blockMint(meme) {
+  // Buang entri kedaluwarsa agar Map tidak tumbuh tanpa batas di uptime panjang
+  pruneSeen(mintFailCooldown, MINT_FAIL_COOLDOWN_MS);
   mintFailCooldown.set(meme, Date.now());
 }
 

@@ -7,6 +7,14 @@ import { now, toNumber, normalizeAddress } from '../utils.js';
  * Mirrors Charon's candidateBuilder, adapted for EVM/Robinhood metrics.
  */
 
+/**
+ * Default keras anti wash-volume (insiden #33: vol24h $2.27M vs liq $18k = 126×).
+ * Turnover organik meme umumnya 1–25×; >50× hampir pasti volume palsu yang
+ * sengaja memicu sinyal volume_spike+trending.
+ * Ditimpa per-strategi: /stratset <id> max_volume_liquidity_ratio <n> (0 = mati).
+ */
+export const DEFAULT_MAX_VOLUME_LIQ_RATIO = 50;
+
 export function signalLabel(meta = {}) {
   return [
     meta.hasVolumeSpike ? 'volume' : null,
@@ -79,6 +87,16 @@ export function filterCandidate(candidate) {
     }
   }
 
+  // Wash-volume guard — SENGAJA di luar blok isFresh: trap seperti insiden #33
+  // justru pool muda dengan volume palsu raksasa. Melihat RATIO, bukan minimum.
+  const maxVlr = strat.max_volume_liquidity_ratio ?? DEFAULT_MAX_VOLUME_LIQ_RATIO;
+  if (maxVlr > 0 && vol24 > 0 && liq > 0) {
+    const vlr = vol24 / liq;
+    if (vlr > maxVlr) {
+      failures.push(`volume/liquidity: ${vlr.toFixed(0)}× > max ${maxVlr}× — anomali wash trading`);
+    }
+  }
+
   // Holders
   if (strat.min_holders > 0 && holders < strat.min_holders) {
     failures.push(`holders: ${holders} < ${strat.min_holders}`);
@@ -102,11 +120,16 @@ export function filterCandidate(candidate) {
     failures.push(`rug score: ${rug.toFixed(2)} > ${strat.max_rug_score}`);
   }
 
-  // Security (honeypot / mint authority / unverified)
+  // Security (honeypot / mint authority / unverified).
+  // Verdict FAIL = probe transfer TERBUKTI ter-gate → lantai keamanan keras yang
+  // berlaku untuk SEMUA strategi, termasuk yang require_security_pass=false
+  // (degen sekalipun tidak boleh membeli token yang tidak bisa dijual).
   const sec = m.securityRiskScore;
   const secVerdict = m.securityVerdict;
-  if (strat.require_security_pass && secVerdict === 'FAIL') {
-    failures.push(`security: FAIL (risk ${sec ?? '?'})`);
+  if (secVerdict === 'FAIL') {
+    failures.push(`security: verdict FAIL (risk ${sec ?? '?'}) — transfer gate terdeteksi`);
+  } else if (strat.require_security_pass && secVerdict !== 'PASS') {
+    failures.push(`security: verdict ${secVerdict} (strategi mewajibkan PASS)`);
   }
   if (strat.max_security_risk > 0 && Number.isFinite(sec) && sec > strat.max_security_risk) {
     failures.push(`security risk: ${sec} > ${strat.max_security_risk}`);

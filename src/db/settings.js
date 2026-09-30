@@ -83,6 +83,7 @@ function defaultStrategy() {
     max_ath_distance_pct: 0,
     trending_min_volume_usd: 5000,
     max_rug_score: 0.5,
+    max_volume_liquidity_ratio: 50,
     position_size_eth: 0.05,
     max_open_positions: 3,
     tp_percent: 50,

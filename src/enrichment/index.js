@@ -176,6 +176,26 @@ export async function enrichToken(mint) {
   };
 }
 
+/**
+ * Anomali pasar yang harus dipertimbangkan LLM — pola yang sering lolos
+ * filter numerik tapi merupakan signature trap (wash volume untuk memicu
+ * volume_spike/trending, holder sybil yang menyamarkan konsentrasi deployer).
+ */
+export function marketAnomalies(m) {
+  const out = [];
+  const vol = Number(m.volume24hUsd);
+  const liq = Number(m.liquidityUsd);
+  if (vol > 0 && liq > 0) {
+    const ratio = vol / liq;
+    if (ratio > 25) out.push(`vol24h ${ratio.toFixed(0)}× liquidity — kemungkinan wash trading`);
+  }
+  const holders = Number(m.holderCount);
+  if (holders >= 100 && Number(m.top10Percent) === 0) {
+    out.push(`top10 holder 0% dgn ${holders} holder — konsentrasi disembunyikan / pola sybil`);
+  }
+  return out;
+}
+
 export function compactForLlm(enriched, filters, signals) {
   const m = enriched.metrics;
   return {
@@ -184,6 +204,7 @@ export function compactForLlm(enriched, filters, signals) {
     name: enriched.meta.name,
     signals,
     dataSources: enriched.sources,
+    anomalies: marketAnomalies(m),
     security: enriched.security
       ? {
           verdict: enriched.security.verdict,

@@ -24,7 +24,7 @@ import { executeLiveBuy } from '../execution/router.js';
 import { refreshCandidateForExecution } from '../execution/positions.js';
 import { sendTelegram, sendPositionOpen, sendTradeIntent, sendBatchReveal } from '../telegram/send.js';
 import { candidateSummary } from '../telegram/format.js';
-import { short, escapeHtml, now } from '../utils.js';
+import { short, escapeHtml, now, pruneSeen } from '../utils.js';
 import { storePriceAlert } from '../db/candidates.js';
 
 export const seenSignalCandidates = new Map();
@@ -51,6 +51,8 @@ export async function processCandidateFromSignals(signalPayload) {
   const signalKey = `${mint}:${signalPayload.route || 'x'}:${Math.floor(now() / 300_000)}`;
   if (seenSignalCandidates.has(signalKey)) return;
   seenSignalCandidates.set(signalKey, now());
+  // Bucket 5-menit — buang entri > 30 menit agar Map tidak tumbuh tanpa batas
+  pruneSeen(seenSignalCandidates, 30 * 60_000);
 
   // Dip buy: arm a price alert instead of buying immediately
   if (strat.entry_mode === 'wait_for_dip' && strat.max_ath_distance_pct < 0) {
